@@ -74,13 +74,15 @@ pre { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; 
 
 #demo-banner { background: linear-gradient(90deg, #2a2214, #161b23); border-bottom: 1px solid var(--accent); padding: 8px 16px; font-size: 12px; color: var(--dim); display: flex; gap: 12px; align-items: center; }
 #demo-banner strong { color: var(--accent); }
-#demo-banner button { padding: 3px 10px; font-size: 12px; margin-left: auto; }
+#demo-banner button { padding: 3px 10px; font-size: 12px; }
+#demo-banner button:first-of-type { margin-left: auto; }
 </style>
 </head>
 <body>
 <div id="demo-banner">
   <strong>INTERACTIVE DEMO</strong>
   <span>Everything runs in your browser with deterministic mock APIs — real agents, real gates, real scoring. Nothing leaves this page.</span>
+  <button onclick="demoTour.start()" data-testid="tour-start">Show tour</button>
   <button onclick="demoReset()" data-testid="demo-reset">Reset demo data</button>
 </div>
 <div id="app">
@@ -1606,6 +1608,179 @@ function renderSettings(c) {
 }
 
 refresh();
+
+</script>
+<script>
+/* Guided tour for the interactive demo. Spotlights console elements with
+ * coach-mark bubbles. Auto-starts on first visit (localStorage flag),
+ * replayable via the banner button. Inlined into demo.html by build-demo.js. */
+(function () {
+  const DONE_KEY = 'aureva-tour-done';
+
+  const style = document.createElement('style');
+  style.textContent = `
+#tour .tour-blocker { position: fixed; inset: 0; z-index: 60; }
+#tour .tour-hole { position: fixed; z-index: 61; border-radius: 10px; pointer-events: none;
+  box-shadow: 0 0 0 9999px rgba(5,8,12,.74); border: 1.5px solid var(--accent);
+  transition: all .25s ease; animation: tourpulse 1.6s ease-in-out infinite; }
+@keyframes tourpulse { 50% { border-color: rgba(212,162,76,.35); } }
+#tour .tour-bubble { position: fixed; z-index: 62; background: var(--panel);
+  border: 1px solid var(--accent); border-radius: 12px; padding: 16px 18px;
+  box-shadow: 0 12px 44px rgba(0,0,0,.65); transition: top .25s ease, left .25s ease; }
+#tour .tour-title { font-weight: 700; color: var(--accent); margin-bottom: 6px; font-size: 14px; }
+#tour .tour-text { font-size: 13px; color: var(--text); line-height: 1.55; }
+#tour .tour-text b { color: var(--accent2); }
+#tour .tour-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 14px; gap: 8px; }
+#tour .tour-progress { color: var(--dim); font-size: 12px; white-space: nowrap; }
+#tour .tour-btns { display: flex; gap: 6px; }
+#tour button { padding: 5px 12px; font-size: 12px; }`;
+  document.head.appendChild(style);
+
+  const steps = [
+    {
+      title: 'Welcome to the Aureva pipeline console',
+      text: 'Seven agents take a client from onboarding to AI citations — Research, Brief, Writer, Quality, Publish, Monitor, Optimize. Everything here is <b>really running in your browser</b>: real agents, real gates, real scoring, with mock external APIs. Click anywhere (or Next) to take the 60-second tour.'
+    },
+    {
+      sel: '[data-testid="client-list"]',
+      title: 'Two demo clients are pre-loaded',
+      text: '<b>Meridian Legal</b> has been through the whole loop: 12 articles live, a citation drop detected and auto-optimized. <b>Nordwind SaaS</b> is mid-flow with drafts waiting for client review. Switch anytime — every client has fully separate state.'
+    },
+    {
+      sel: '[data-testid="run-full"]',
+      pre: () => { window.setTab('pipeline'); },
+      title: 'One click runs the whole pipeline',
+      text: 'Research → Brief → Writer → Quality → Publish, in sequence. It <b>halts at every human gate</b> — a specialist must approve the content plan, and (optionally) the client must approve drafts — then resumes where it left off.'
+    },
+    {
+      sel: '[data-testid="stage-research"]',
+      title: '…or run any agent on its own',
+      text: 'Each of the 7 cards is one agent, independently triggerable. Under each you see its last result with a status: <b>PASS</b>, <b>NEEDS REVIEW</b>, <b>FAIL</b> or <b>ESCALATE TO HUMAN</b> — the same statuses the agents pass to each other.'
+    },
+    {
+      sel: '#tab-body',
+      pre: () => { window.setTab('plan'); },
+      title: 'The plan gate',
+      text: 'Research produced this keyword plan — <b>long-tail, low-competition first</b>, grouped into hub-and-spoke clusters. Nothing gets written until a specialist clicks Approve. This one is a <b>v2 plan</b>: it already contains a content gap fed back by the Monitor agent.'
+    },
+    {
+      sel: '#tab-body',
+      pre: () => { window.setTab('content'); },
+      title: 'Every article is scored before it can go live',
+      text: 'The Quality agent scores drafts 0–100 on GEO criteria (direct answer, entities, facts, FAQ, schema…). Below threshold → <b>sent back to the Writer</b>, rewritten, rescored. Note the <b>attempt column</b>: some drafts needed a retry. Click <b>View</b> on any article for the full score breakdown.'
+    },
+    {
+      sel: '#tab-body',
+      pre: () => { window.setTab('publishing'); },
+      title: 'Published, indexed, AI-discoverable',
+      text: 'Each post goes live with metadata, canonical and JSON-LD schema — open one via its link. After every publish the <b>llms.txt</b> discovery file is regenerated and <b>IndexNow + Search Console</b> are pinged. Publishing refuses to run if robots.txt blocks AI crawlers.'
+    },
+    {
+      sel: '#tab-body',
+      pre: () => { window.setTab('monitoring'); },
+      title: 'The watchtower — and the loop',
+      text: 'Weekly reports track rankings, traffic and <b>citation status per AI engine</b> (ChatGPT, Gemini, Perplexity, Google AI Overview). A dropped citation flags the page; the <b>Optimizer</b> rewrites, extends the FAQ, republishes — and feeds new gaps back to Research. The pipeline never stops.'
+    },
+    {
+      sel: '[data-testid="tab-escalations"]',
+      title: 'When agents need a human',
+      text: 'Anything the machine can’t resolve — quality failures after max retries, blocked crawlers — lands in the <b>escalation queue</b> for one-click resolution. Combined with the per-client <b>audit log</b> (next tab), every decision is traceable.'
+    },
+    {
+      sel: '#tab-body',
+      pre: () => { window.setTab('settings'); },
+      title: 'Tune the machine per client',
+      text: 'Quality threshold, retry limit, drop sensitivity, auto-publish vs client review — all configurable. Try setting the quality minimum to <b>101</b> and running the pipeline to watch escalations happen. This is also where the <b>WordPress plugin API key</b> lives.'
+    },
+    {
+      title: 'Your turn',
+      text: 'Onboard your own client, approve plans, reject drafts, break things. <b>Reset demo data</b> in the top banner restores this seeded state, and <b>Show tour</b> replays this walkthrough. Enjoy.',
+      pre: () => { window.setTab('pipeline'); }
+    }
+  ];
+
+  let i = 0, root = null;
+
+  function build() {
+    root = document.createElement('div');
+    root.id = 'tour';
+    root.innerHTML = `
+      <div class="tour-blocker"></div>
+      <div class="tour-hole"></div>
+      <div class="tour-bubble" data-testid="tour-bubble">
+        <div class="tour-title"></div>
+        <div class="tour-text"></div>
+        <div class="tour-foot">
+          <span class="tour-progress" data-testid="tour-progress"></span>
+          <span class="tour-btns">
+            <button class="tour-back" data-testid="tour-back">Back</button>
+            <button class="tour-skip" data-testid="tour-skip">Skip</button>
+            <button class="tour-next primary" data-testid="tour-next">Next</button>
+          </span>
+        </div>
+      </div>`;
+    document.body.appendChild(root);
+    root.querySelector('.tour-back').onclick = (e) => { e.stopPropagation(); i = Math.max(0, i - 1); show(); };
+    root.querySelector('.tour-next').onclick = (e) => { e.stopPropagation(); next(); };
+    root.querySelector('.tour-skip').onclick = (e) => { e.stopPropagation(); end(); };
+    root.querySelector('.tour-blocker').onclick = next;
+    window.addEventListener('resize', () => { if (root.style.display !== 'none') position(); });
+  }
+
+  function start() { if (!root) build(); i = 0; root.style.display = 'block'; show(); }
+  function next() { if (i >= steps.length - 1) return end(); i++; show(); }
+  function end() { localStorage.setItem(DONE_KEY, '1'); if (root) root.style.display = 'none'; }
+
+  function show() {
+    const s = steps[i];
+    if (s.pre) { try { s.pre(); } catch (e) { /* view not available; bubble centers */ } }
+    root.querySelector('.tour-title').textContent = s.title;
+    root.querySelector('.tour-text').innerHTML = s.text;
+    root.querySelector('.tour-progress').textContent = `${i + 1} / ${steps.length}`;
+    root.querySelector('.tour-back').style.visibility = i ? 'visible' : 'hidden';
+    root.querySelector('.tour-next').textContent = i === steps.length - 1 ? 'Finish' : 'Next';
+    setTimeout(position, 90); // let the tab render before measuring
+  }
+
+  function position() {
+    const s = steps[i];
+    const t = s.sel ? document.querySelector(s.sel) : null;
+    const hole = root.querySelector('.tour-hole');
+    const b = root.querySelector('.tour-bubble');
+    b.style.width = Math.min(360, innerWidth - 24) + 'px';
+    if (!t) {
+      hole.style.display = 'none';
+      b.style.top = '50%'; b.style.left = '50%'; b.style.transform = 'translate(-50%,-50%)';
+      return;
+    }
+    t.scrollIntoView({ block: 'center' });
+    const r = t.getBoundingClientRect();
+    const pad = 6;
+    hole.style.display = 'block';
+    hole.style.top = (r.top - pad) + 'px';
+    hole.style.left = (r.left - pad) + 'px';
+    hole.style.width = (r.width + pad * 2) + 'px';
+    hole.style.height = (r.height + pad * 2) + 'px';
+    b.style.transform = 'none';
+    const bw = b.offsetWidth, bh = b.offsetHeight;
+    let top = r.bottom + pad + 12;
+    if (top + bh > innerHeight - 12) top = Math.max(12, r.top - pad - bh - 12);
+    const left = Math.min(Math.max(12, r.left), innerWidth - bw - 12);
+    b.style.top = top + 'px';
+    b.style.left = left + 'px';
+  }
+
+  window.demoTour = { start };
+
+  // auto-start on first visit, once the console has rendered
+  if (!localStorage.getItem(DONE_KEY)) {
+    let tries = 0;
+    const timer = setInterval(() => {
+      if (document.querySelector('[data-testid="client-name"]')) { clearInterval(timer); start(); }
+      else if (++tries > 50) clearInterval(timer);
+    }, 100);
+  }
+})();
 
 </script>
 </body>
