@@ -71,6 +71,9 @@ pre { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; 
 .mono { font-family: ui-monospace, monospace; font-size: 12px; }
 .empty { color: var(--dim); padding: 24px; text-align: center; border: 1px dashed var(--line); border-radius: 8px; margin-top: 10px; }
 .cite-yes { color: var(--ok); } .cite-no { color: var(--bad); }
+.cite-nobody { color: var(--accent); }
+.b-visible { color: var(--ok); border-color: var(--ok); }
+.b-hidden { color: var(--accent); border-color: var(--accent); }
 
 #demo-banner { background: linear-gradient(90deg, #2a2214, #161b23); border-bottom: 1px solid var(--accent); padding: 8px 16px; font-size: 12px; color: var(--dim); display: flex; gap: 12px; align-items: center; }
 #demo-banner strong { color: var(--accent); }
@@ -148,11 +151,13 @@ __define('mock', function (module, exports, require) {
 'use strict';
 // Deterministic mock adapters for every external service in the brief.
 // Live implementations (Google Ads, DataForSEO, GSC, GA4, Ahrefs, WordPress REST,
-// IndexNow, Anthropic LLM, per-engine citation checks) replace these one-for-one:
-// same function signatures, real transport.
+// IndexNow, Anthropic LLM, per-engine citation checks, site crawler) replace these
+// one-for-one: same function signatures, real transport.
 const { fnv1a, slugify, now } = require('../util');
 
 const ENGINES = ['chatgpt', 'gemini', 'perplexity', 'google_ai_overview'];
+// July 2026 update §2.3: robots.txt must explicitly allow all six.
+const REQUIRED_BOTS = ['GPTBot', 'ClaudeBot', 'PerplexityBot', 'Googlebot', 'Gemini-Bot', 'Bingbot'];
 
 // ---- Research adapters -----------------------------------------------------
 
@@ -211,6 +216,96 @@ function fanOutQueries(keyword) {
   return [`${keyword} explained`, `${keyword} pros and cons`, `${keyword} examples`];
 }
 
+// ---- Baseline audit adapters (Agent 0) ---------------------------------------
+
+// Site crawler mock — the client's pre-existing pages, as found at onboarding.
+// Legacy content is deliberately imperfect: thin pages, one JS-rendered page,
+// one orphan, missing schema, and fact claims that disagree with each other
+// (their values derive from the URL, not the client, so they conflict both with
+// each other and — sometimes — with what the writer produces later).
+function existingSite(client) {
+  const mk = (path, title, opts = {}) => {
+    const h = fnv1a(client.domain + path);
+    return {
+      url: `https://${client.domain}${path}`,
+      title,
+      wordCount: opts.thin ? 300 + (h % 400) : 900 + (h % 900),
+      hasSchema: !!opts.schema,
+      jsRendered: !!opts.jsRendered,
+      orphan: !!opts.orphan,
+      faqCount: opts.faq || 0,
+      facts: (opts.subjects || []).map(subject => ({
+        subject,
+        claim: `${legacyFactValue(client.domain + path, subject)}% of B2B buyers now start research in an AI assistant`,
+        value: legacyFactValue(client.domain + path, subject),
+        source: 'uncited'
+      })),
+      ...opts
+    };
+  };
+  return [
+    mk('/about', `About ${client.name}`, { thin: true, subjects: [] }),
+    mk('/services', `${client.name} — Services`, { schema: true, subjects: [`metric-1`] }),
+    // the two legacy blog posts share metric-1 with /services and each other →
+    // guaranteed contradiction material for the baseline scan
+    mk('/blog/old-industry-overview', `The state of ${client.niche}`, { subjects: ['metric-1', 'metric-2'], faq: 1 }),
+    mk('/blog/legacy-tips', `${client.niche}: 7 tips`, { thin: true, jsRendered: true, orphan: true, subjects: ['metric-2'] })
+  ];
+}
+
+function legacyFactValue(basis, subject) {
+  return 40 + (fnv1a(basis + subject) % 45); // 40–84, a different derivation than the writer's
+}
+
+// Citability heuristic for existing pages (0–100) — a lightweight cousin of the
+// full rubric, appropriate for content we didn't produce.
+function scoreExistingPage(page) {
+  let score = 0;
+  score += page.wordCount >= 1500 ? 25 : page.wordCount >= 800 ? 15 : 5;
+  score += page.hasSchema ? 20 : 0;
+  score += page.faqCount >= 1 ? 15 : 0;
+  score += page.jsRendered ? 0 : 25; // invisibility penalty: JS-rendered content hurts
+  score += page.orphan ? 0 : 15;    // orphans break authority flow
+  return score;
+}
+
+// Per-query per-engine baseline citation ownership: who does this engine cite
+// today — the client, a competitor, or nobody (citation whitespace)?
+function queryCitationOwner(client, query, engine, runIndex = 0) {
+  const h = fnv1a(client.domain + query + engine + (runIndex ? `run${Math.floor(runIndex / 3)}` : 'baseline'));
+  const roll = h % 10;
+  if (roll < 4) return null; // nobody cited — whitespace, the cheapest win
+  if (roll < 8) return `competitor:${(client.competitors[h % client.competitors.length] || 'unknown').replace(/^https?:\/\//, '')}`;
+  return 'client';
+}
+
+// Contradiction detector v1 — same fact subject, materially different values.
+// Works on anything exposing { facts: [{ subject, value, claim }] } plus a label.
+function findContradictions(items) {
+  const seen = new Map(); // subject → [{ label, value, claim }]
+  const out = [];
+  for (const it of items) {
+    for (const f of it.facts || []) {
+      if (!f.subject || typeof f.value !== 'number') continue;
+      const prevList = seen.get(f.subject) || [];
+      for (const prev of prevList) {
+        if (prev.label !== it.label && Math.abs(prev.value - f.value) >= 5) {
+          out.push({
+            subject: f.subject,
+            a: { label: prev.label, claim: prev.claim, value: prev.value },
+            b: { label: it.label, claim: f.claim, value: f.value },
+            delta: Math.abs(prev.value - f.value),
+            severe: Math.abs(prev.value - f.value) >= 15
+          });
+        }
+      }
+      prevList.push({ label: it.label, value: f.value, claim: f.claim });
+      seen.set(f.subject, prevList);
+    }
+  }
+  return out;
+}
+
 // ---- Measure adapters ------------------------------------------------------
 
 // Google Search Console mock — impressions/clicks/position per keyword.
@@ -233,6 +328,12 @@ function ga4Data(clientId, runIndex) {
     engagementRate: +(0.45 + (h % 30) / 100).toFixed(2),
     conversions: 5 + (h % 40) + runIndex
   };
+}
+
+// Per-article weekly visitors (GA4 page-level mock) — drives the hidden-post
+// traffic threshold. Rises run over run so notifications reliably appear.
+function articleVisitors(clientId, slug, runIndex) {
+  return (fnv1a(clientId + slug + 'visitors') % 5) + runIndex * 2;
 }
 
 // AI Citation Simulator mock — per engine, per article. Citations are
@@ -269,26 +370,45 @@ function robotsTxt(client) {
   if (client.simulateRobotsBlock) {
     return 'User-agent: GPTBot\nDisallow: /\n\nUser-agent: *\nAllow: /\n';
   }
-  return ['GPTBot', 'ClaudeBot', 'PerplexityBot', 'Googlebot']
+  return REQUIRED_BOTS
     .map(b => `User-agent: ${b}\nAllow: /`).join('\n\n') + '\n\nSitemap: /sitemap.xml\n';
 }
 
 function crawlCheck(client) {
   const txt = robotsTxt(client);
-  const required = ['GPTBot', 'ClaudeBot', 'PerplexityBot', 'Googlebot'];
-  const blocked = required.filter(bot =>
+  const blocked = REQUIRED_BOTS.filter(bot =>
     new RegExp(`User-agent: ${bot}\\nDisallow: /`).test(txt) ||
     (/User-agent: \*\nDisallow: \//.test(txt) && !txt.includes(`User-agent: ${bot}\nAllow`)));
-  return { ok: blocked.length === 0, blocked };
+  return { ok: blocked.length === 0, blocked, required: REQUIRED_BOTS };
+}
+
+// Symmetry gate (July update §1.4): 1:1 parity between the DOM (what renders)
+// and the JSON-LD metadata. Any mismatch = ambiguous signal = no publish.
+function symmetryCheck(article) {
+  const mismatches = [];
+  if (article.schemaHeadline !== article.title) {
+    mismatches.push(`JSON-LD headline "${article.schemaHeadline}" ≠ H1 "${article.title}"`);
+  }
+  const opening = (article.directAnswer || '').split(/\s+/).slice(0, 12).join(' ');
+  if (opening && article.schemaDescription && !article.schemaDescription.startsWith(opening.split(' ').slice(0, 4).join(' '))) {
+    mismatches.push('JSON-LD description does not derive from the opening paragraph');
+  }
+  return { ok: mismatches.length === 0, mismatches };
 }
 
 // WordPress REST API mock — writes into the client's mock site state.
+// Posts are created "published but not in navigation" (July update §2.1):
+// live URL, discoverable via sitemap + llms.txt, invisible to site visitors
+// until the client opts in after the traffic threshold.
 function wpUpsertPost(client, article) {
   const url = `/mock-wp/${client.id}/posts/${article.slug}`;
   const post = {
     slug: article.slug,
     title: article.title,
     url,
+    inNavigation: article.visibility === 'visible',
+    clusterTopic: article.clusterTopic || null,
+    isPillar: !!article.isPillar,
     metaTitle: `${article.title} | ${client.name}`,
     metaDescription: article.directAnswer.split(/\s+/).slice(0, 24).join(' ') + '…',
     canonical: url,
@@ -299,6 +419,7 @@ function wpUpsertPost(client, article) {
     schema: buildSchema(client, article),
     body: article.sections,
     faq: article.faq,
+    internalLinks: article.internalLinks,
     version: article.version,
     updatedAt: now()
   };
@@ -307,10 +428,34 @@ function wpUpsertPost(client, article) {
   return post;
 }
 
+// Publish-confirmation webhook mock. In production the WordPress plugin calls
+// POST /api/plugin/publish-confirmation; here the mock confirms instantly
+// unless the demo toggle simulates a dead webhook.
+function webhookConfirm(client, article) {
+  if (client.simulateWebhookFailure) return { confirmed: false };
+  return { confirmed: true, at: now() };
+}
+
+// Post-publish verification (July update §2.3): the live URL must return 200
+// and carry the full article as static HTML — body, FAQ and JSON-LD present,
+// nothing left to client-side rendering.
+function verifyPublished(client, article) {
+  const post = client.wp.posts.find(p => p.slug === article.slug);
+  const checks = {
+    status200: !!post,
+    staticBody: !!post && post.body.length >= 4 && post.body.every(s => s.content && s.content.length > 100),
+    faqPresent: !!post && (article.faq.length === 0 || post.faq.length === article.faq.length),
+    schemaEmbedded: !!post && post.schema.length >= 1,
+    notJsRendered: true // the mock renderer emits static HTML only
+  };
+  return { ok: Object.values(checks).every(Boolean), checks };
+}
+
 function buildSchema(client, article) {
   const schemas = [{
     '@type': article.schemaType || 'BlogPosting',
-    headline: article.title,
+    headline: article.schemaHeadline || article.title,
+    description: article.schemaDescription || undefined,
     author: { '@type': 'Person', name: `${client.name} Editorial`, url: `/mock-wp/${client.id}/author` },
     datePublished: article.publishedAt || now()
   }];
@@ -326,14 +471,44 @@ function buildSchema(client, article) {
   return schemas;
 }
 
-// llms.txt generator — regenerated after every publish/optimize (brief §6.2).
+// llms.txt generator — regenerated after every publish/optimize. July update
+// §2.3: each entry lists URL, a one-sentence description AND its topic cluster.
 function renderLlmsTxt(client) {
   const lines = [
     `# ${client.name}`, `> ${client.niche}`, '', '## Key pages'
   ];
   for (const p of client.wp.posts) {
-    lines.push(`- [${p.title}](${p.url}): ${p.metaDescription}`);
+    const cluster = p.clusterTopic ? ` [cluster: ${p.clusterTopic}]` : '';
+    lines.push(`- [${p.title}](${p.url}): ${p.metaDescription}${cluster}`);
   }
+  return lines.join('\n') + '\n';
+}
+
+// XML sitemap generator — July update §2.3: articles grouped into topical
+// clusters (not a flat list), pillar URL first in its cluster group, with
+// lastmod and changefreq. Hidden posts ARE listed — the sitemap is exactly
+// how AI crawlers discover them.
+function renderSitemap(client) {
+  const groups = new Map();
+  for (const p of client.wp.posts) {
+    const key = p.clusterTopic || 'uncategorised';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(p);
+  }
+  const lines = ['<?xml version="1.0" encoding="UTF-8"?>',
+    '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'];
+  for (const [topic, posts] of groups) {
+    posts.sort((a, b) => (b.isPillar ? 1 : 0) - (a.isPillar ? 1 : 0));
+    lines.push(`  <!-- cluster: ${topic} -->`);
+    for (const p of posts) {
+      lines.push('  <url>',
+        `    <loc>${p.url}</loc>`,
+        `    <lastmod>${p.updatedAt.slice(0, 10)}</lastmod>`,
+        '    <changefreq>weekly</changefreq>',
+        '  </url>');
+    }
+  }
+  lines.push('</urlset>');
   return lines.join('\n') + '\n';
 }
 
@@ -347,6 +522,7 @@ function ping(client, service, urls) {
 // brief + brand voice; rewrite() maps quality feedback to targeted edits.
 
 const AUTHORITY_SOURCES = ['Harvard Business Review', 'Gartner', 'McKinsey', 'Statista', 'Forrester'];
+const FACT_SUBJECT_SPACE = 23;
 
 function para(topic, angleWord, n) {
   const sentences = [];
@@ -359,10 +535,37 @@ function para(topic, angleWord, n) {
   return sentences.join(' ');
 }
 
+// Semantic relationship link (July update §1.5): not a bare hyperlink but a
+// conceptual bridge explaining HOW the two pieces of content relate.
+function linkContext(fromKeyword, target, niche) {
+  return `This approach to ${fromKeyword} is the practical application of the framework covered in ` +
+    `our guide to ${target.replace(/-/g, ' ')}, which explains the criteria ${niche} teams use ` +
+    `when weighing the same decision at a different stage.`;
+}
+
+// The writer is self-consistent per client: a fact's value derives from the
+// client domain + subject, so the same statistic never disagrees with itself
+// across the corpus. (Legacy site content uses a different derivation — see
+// existingSite — which is what the contradiction scan exists to catch.)
+function factFor(client, subjectIndex) {
+  const subject = `metric-${subjectIndex}`;
+  const value = 62 + (fnv1a(client.domain + subject) % 30);
+  return {
+    subject,
+    value,
+    claim: `${value}% of B2B buyers now start research in an AI assistant`,
+    source: AUTHORITY_SOURCES[subjectIndex % AUTHORITY_SOURCES.length],
+    year: 2024 + (subjectIndex % 3)
+  };
+}
+
 function writeArticle(client, brief, attempt) {
   const kw = brief.targetKeywords[0];
-  const h = fnv1a(client.id + kw);
-  const omitFaq = attempt === 1 && brief.index % 3 === 0; // some first drafts miss the FAQ
+  const h = fnv1a(client.domain + kw); // domain-based: content is deterministic per client site
+  // Documented first-draft imperfections (exercise every control loop):
+  const omitFaq = attempt === 1 && brief.index % 3 === 0;          // → quality retry
+  const omitLinkContext = attempt === 1 && brief.index % 5 === 1;  // → rubric v2 retry
+  const driftSchema = attempt === 1 && brief.index % 4 === 2;      // → publish symmetry gate
   const angleWord = ['contrarian', 'operator-first', 'evidence-led', 'cost-aware'][h % 4];
 
   const directAnswer =
@@ -382,11 +585,7 @@ function writeArticle(client, brief, attempt) {
   const facts = [];
   const factCount = 5 + (h % 3) + (attempt > 1 ? 1 : 0);
   for (let i = 0; i < factCount; i++) {
-    facts.push({
-      claim: `${62 + ((h + i * 7) % 30)}% of B2B buyers now start research in an AI assistant`,
-      source: AUTHORITY_SOURCES[(h + i) % AUTHORITY_SOURCES.length],
-      year: 2024 + ((h + i) % 3)
-    });
+    facts.push(factFor(client, (h + i * 7) % FACT_SUBJECT_SPACE));
   }
 
   const sections = brief.headings.filter(hd => hd !== 'FAQ').map((heading, i) => ({
@@ -397,8 +596,15 @@ function writeArticle(client, brief, attempt) {
   const faq = omitFaq ? [] : defaultFaq(kw);
   const schemaTypes = [brief.schemaType, 'Person'].concat(faq.length ? ['FAQPage'] : []);
 
+  const title = `${cap(kw)}: The ${cap(angleWord)} Playbook`;
+  const internalLinks = (brief.internalLinkTargets || []).slice(0, 3 + (h % 2)).map(t => ({
+    target: t.slug || t,
+    context: omitLinkContext ? '' : linkContext(kw, t.slug || t, client.niche),
+    sameCluster: typeof t === 'object' ? !!t.sameCluster : false
+  }));
+
   const article = {
-    title: `${cap(kw)}: The ${cap(angleWord)} Playbook`,
+    title,
     slug: slugify(kw),
     keyword: kw,
     targetKeywords: brief.targetKeywords,
@@ -410,7 +616,12 @@ function writeArticle(client, brief, attempt) {
     structuredBlocks: 2 + (h % 2), // numbered lists + definition blocks
     schemaTypes,
     schemaType: brief.schemaType,
-    internalLinks: brief.internalLinkTargets.slice(0, 3 + (h % 2)),
+    // symmetry drift: a keyword-stuffed schema headline that no longer matches the H1
+    schemaHeadline: driftSchema ? `${cap(kw)} — Best ${cap(client.niche)} ${new Date().getFullYear()}` : title,
+    schemaDescription: directAnswer.split(/\s+/).slice(0, 24).join(' ') + '…',
+    internalLinks,
+    clusterTopic: brief.clusterTopic || null,
+    isPillar: !!brief.isPillar,
     angle: brief.uniqueAngle,
     attempt
   };
@@ -427,7 +638,9 @@ function defaultFaq(kw) {
   ];
 }
 
-// Rewrite maps failed criteria to targeted improvements.
+// Rewrite maps failed criteria to targeted improvements. Rewrites are always
+// symmetry-clean and context-complete — attempt > 1 disables the first-draft
+// imperfections above.
 function rewriteArticle(client, brief, article, failed) {
   const next = writeArticle(client, brief, article.attempt + 1);
   next.attempt = article.attempt + 1;
@@ -451,9 +664,12 @@ function countWords(article) {
 function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 
 module.exports = {
-  ENGINES, expandKeywords, autocomplete, competitorGaps, fanOutQueries,
-  gscKeywordData, ga4Data, citationCheck, botVisits, impressionGaps,
-  robotsTxt, crawlCheck, wpUpsertPost, renderLlmsTxt, ping,
+  ENGINES, REQUIRED_BOTS,
+  expandKeywords, autocomplete, competitorGaps, fanOutQueries,
+  existingSite, scoreExistingPage, queryCitationOwner, findContradictions,
+  gscKeywordData, ga4Data, articleVisitors, citationCheck, botVisits, impressionGaps,
+  robotsTxt, crawlCheck, symmetryCheck, wpUpsertPost, webhookConfirm, verifyPublished,
+  renderLlmsTxt, renderSitemap, ping,
   writeArticle, rewriteArticle, defaultFaq
 };
 
@@ -461,13 +677,72 @@ module.exports = {
 
 __define('agents', function (module, exports, require) {
 'use strict';
-// The 7 agents. Each is a pure-ish function over client state returning
-// { agent, status, summary, data? } with status PASS | FAIL | NEEDS_REVIEW | ESCALATE_TO_HUMAN.
+// The 7 pipeline agents + the baseline audit (Agent 0). Each is a pure-ish
+// function over client state returning { agent, status, summary, data? } with
+// status PASS | FAIL | NEEDS_REVIEW | ESCALATE_TO_HUMAN.
 // Orchestration (gates, retries, audit, escalations) lives in orchestrator.js.
 const mock = require('./adapters/mock');
 const { uid, slugify, now } = require('./util');
 
 const COMP_RANK = { low: 0, medium: 1, high: 2 };
+
+// ---- Agent 0: Baseline audit ---------------------------------------------------
+// Runs before any engagement (auto at onboarding, re-runnable): the client's
+// existing pages scored for citability, contradiction scan across the legacy
+// corpus, per-query/per-engine citation ownership incl. whitespace, robots audit.
+// This is the before/after evidence base for retention reporting.
+function baseline(client) {
+  const pages = mock.existingSite(client).map(p => ({
+    ...p,
+    citability: mock.scoreExistingPage(p)
+  }));
+
+  const contradictions = mock.findContradictions(
+    pages.map(p => ({ label: p.url, facts: p.facts })));
+
+  const queries = [];
+  for (const seed of client.keywords) {
+    queries.push(seed, ...mock.fanOutQueries(seed).slice(0, 2));
+  }
+  const queryBaseline = queries.slice(0, 8).map(q => {
+    const engines = {};
+    for (const e of mock.ENGINES) engines[e] = mock.queryCitationOwner(client, q, e);
+    return { query: q, engines };
+  });
+  const whitespace = queryBaseline
+    .filter(row => Object.values(row.engines).filter(v => v === null).length >= 2)
+    .map(row => row.query);
+
+  const robots = mock.crawlCheck(client);
+  const avgCitability = Math.round(pages.reduce((s, p) => s + p.citability, 0) / pages.length);
+
+  client.baseline = {
+    id: uid('base'),
+    createdAt: now(),
+    pages,
+    contradictions,
+    queries: queryBaseline,
+    whitespace,
+    robots,
+    summary: {
+      avgCitability,
+      jsRenderedPages: pages.filter(p => p.jsRendered).length,
+      orphanPages: pages.filter(p => p.orphan).length,
+      pagesWithoutSchema: pages.filter(p => !p.hasSchema).length,
+      contradictionsFound: contradictions.length,
+      whitespaceQueries: whitespace.length
+    }
+  };
+
+  return {
+    agent: 'baseline',
+    status: robots.ok ? 'PASS' : 'ESCALATE_TO_HUMAN',
+    summary: `Baseline audit: ${pages.length} existing pages (avg citability ${avgCitability}/100), ` +
+      `${contradictions.length} contradictions, ${whitespace.length}/${queryBaseline.length} queries with citation whitespace, ` +
+      `robots.txt ${robots.ok ? 'allows all AI crawlers' : `BLOCKS ${robots.blocked.join(', ')}`}.`,
+    ...(robots.ok ? {} : { escalation: { reason: `Onboarding robots.txt audit: blocks ${robots.blocked.join(', ')}` } })
+  };
+}
 
 // ---- Agent 1: Research -------------------------------------------------------
 function research(client) {
@@ -478,11 +753,14 @@ function research(client) {
   }
   keywords.push(...mock.competitorGaps(client.competitors, client.niche));
 
-  // gaps fed back from Monitor/Optimize — the loop never stops
+  // gaps fed back from Monitor/Optimize — the loop never stops. Citation
+  // whitespace (queries where no one is cited) is the cheapest win and is
+  // tagged so the plan shows where each keyword came from.
   for (const gap of client.pendingGaps) {
     keywords.push({
       keyword: gap.query, volume: gap.impressions, competition: 'low',
-      cpc: 0, intent: 'ai', source: 'gap_feedback'
+      cpc: 0, intent: 'ai',
+      source: gap.type === 'whitespace' ? 'citation_whitespace' : 'gap_feedback'
     });
   }
   const consumedGaps = client.pendingGaps.length;
@@ -490,8 +768,10 @@ function research(client) {
 
   for (const k of keywords) {
     k.fanOut = mock.fanOutQueries(k.keyword);
-    // score: relevance-weighted, low competition boosted (long-tail first)
-    k.score = Math.round((2 - COMP_RANK[k.competition]) * 40 + Math.min(k.volume / 100, 20));
+    // score: relevance-weighted, low competition boosted (long-tail first);
+    // whitespace queries get a bonus — nobody is cited there yet
+    k.score = Math.round((2 - COMP_RANK[k.competition]) * 40 + Math.min(k.volume / 100, 20))
+      + (k.source === 'citation_whitespace' ? 15 : 0);
   }
 
   // topical map: one hub-and-spoke cluster per seed
@@ -523,6 +803,14 @@ function research(client) {
       clusterId: (clusters.find(c => k.keyword.includes(c.topic)) || clusters[clusters.length - 1]).id
     }));
 
+  // contradiction scan across everything already live for this client —
+  // published articles plus legacy baseline pages (July update §4: flag
+  // articles in the existing content that contradict each other)
+  const corpus = client.articles.filter(a => a.publishedUrl)
+    .map(a => ({ label: a.slug, facts: a.facts }))
+    .concat((client.baseline ? client.baseline.pages : []).map(p => ({ label: p.url, facts: p.facts })));
+  const contradictions = mock.findContradictions(corpus);
+
   client.plan = {
     id: uid('plan'),
     version: (client.plan ? client.plan.version : 0) + 1,
@@ -531,7 +819,8 @@ function research(client) {
     keywords,
     clusters,
     prioritizedArticles: prioritized,
-    gapKeywordsConsumed: consumedGaps
+    gapKeywordsConsumed: consumedGaps,
+    contradictions
   };
   client.briefs = [];
 
@@ -539,7 +828,8 @@ function research(client) {
     agent: 'research', status: 'NEEDS_REVIEW',
     summary: `Content plan v${client.plan.version}: ${keywords.length} keywords, ` +
       `${clusters.length} clusters, ${prioritized.length} prioritized articles ` +
-      `(${consumedGaps} gap keywords fed back). Pending specialist approval.`
+      `(${consumedGaps} gap keywords fed back), ${contradictions.length} corpus contradictions flagged. ` +
+      'Pending specialist approval.'
   };
 }
 
@@ -554,15 +844,28 @@ function brief(client) {
     // hub-and-spoke: spoke articles link to the pillar + siblings; the pillar
     // links to its spokes. Small clusters are padded with other pillars so
     // every article still gets >=3 internal link targets (no self-links).
-    const targets = [...new Set([
-      cluster.pillar,
-      ...cluster.spokes,
-      ...client.plan.clusters.filter(c => c.id !== cluster.id).map(c => c.pillar)
-    ])].filter(t => t !== item.keyword).slice(0, 5);
+    // Targets carry sameCluster so the writer/quality can enforce topical
+    // coherence (Signal Clarity: connected knowledge network, not islands).
+    const own = [cluster.pillar, ...cluster.spokes].filter(t => t !== item.keyword);
+    const other = client.plan.clusters.filter(c => c.id !== cluster.id).map(c => c.pillar);
+    const seen = new Set();
+    const targets = [];
+    for (const [list, sameCluster] of [[own, true], [other, false]]) {
+      for (const t of list) {
+        const slug = slugify(t);
+        if (t === item.keyword || seen.has(slug)) continue;
+        seen.add(slug);
+        targets.push({ slug, sameCluster });
+        if (targets.length >= 5) break;
+      }
+      if (targets.length >= 5) break;
+    }
     return {
       id: uid('brief'),
       index,
       clusterId: cluster.id,
+      clusterTopic: cluster.topic,
+      isPillar: item.keyword === cluster.pillar,
       targetKeywords: [item.keyword, ...mock.fanOutQueries(item.keyword).slice(0, 2)],
       wordCount: 2200,
       headings: [
@@ -573,7 +876,7 @@ function brief(client) {
         'Benchmarks, tools and comparisons',
         'FAQ'
       ],
-      internalLinkTargets: targets.map(slugify),
+      internalLinkTargets: targets,
       schemaType: item.keyword === cluster.pillar ? 'Article' : 'BlogPosting',
       competitorUrls: client.competitors,
       uniqueAngle: `the ${['operator', 'buyer', 'auditor', 'skeptic'][index % 4]}'s view of ${item.keyword}, ` +
@@ -597,7 +900,8 @@ function writer(client) {
       const draft = mock.writeArticle(client, b, 1);
       client.articles.push({
         id: uid('art'), briefId: b.id, clusterId: b.clusterId,
-        status: 'draft', version: 1, feedback: null, ...draft
+        status: 'draft', version: 1, feedback: null,
+        visibility: 'hidden', webhookStatus: null, ...draft
       });
       written++;
     } else if (existing.status === 'draft' && existing.feedback) {
@@ -612,31 +916,75 @@ function writer(client) {
   return {
     agent: 'writer', status: 'PASS',
     summary: `${written} drafts written${rewritten ? `, ${rewritten} rewritten after feedback` : ''}. ` +
-      'GEO-structured: direct answer, entities, sourced facts, schema, internal links.'
+      'Signal-Clarity structured: direct answer, entities, sourced facts, schema, semantic relationship links.'
   };
 }
 
-// ---- Agent 4: Quality — GEO scoring rubric (SPEC §5) ---------------------------
-function scoreArticle(a) {
+// ---- Agent 4: Quality — Signal Clarity rubric v2 (SPEC §5) ---------------------
+const RUBRIC_WEIGHTS = {
+  directAnswer: 10, entityDensity: 10, factDensity: 10, faq: 10,
+  structuredAnswers: 10, schemaReadiness: 10, uniqueAngle: 10, wordCount: 10,
+  semanticLinks: 10, topicalCoherence: 10
+};
+
+function scoreArticle(a, weights) {
+  const W = { ...RUBRIC_WEIGHTS, ...(weights || {}) };
+  const part = (w, frac) => Math.round(w * frac);
   const breakdown = {};
   const failed = [];
   const daWords = (a.directAnswer || '').split(/\s+/).filter(Boolean).length;
-  breakdown.directAnswer = a.directAnswer && daWords <= 150 && daWords >= 20 ? 15 : 0;
-  breakdown.entityDensity = Math.min(15, Math.round((a.entities.length * 15) / 8));
-  breakdown.factDensity = Math.min(15, a.facts.length * 3);
-  breakdown.faq = a.faq.length >= 3 ? 15 : (a.faq.length > 0 ? 7 : 0);
-  breakdown.structuredAnswers = a.structuredBlocks >= 2 ? 10 : (a.structuredBlocks >= 1 ? 5 : 0);
+  breakdown.directAnswer = a.directAnswer && daWords <= 150 && daWords >= 20 ? W.directAnswer : 0;
+  breakdown.entityDensity = Math.min(W.entityDensity, part(W.entityDensity, a.entities.length / 8));
+  breakdown.factDensity = Math.min(W.factDensity, part(W.factDensity, a.facts.length / 5));
+  breakdown.faq = a.faq.length >= 3 ? W.faq : (a.faq.length > 0 ? part(W.faq, 0.5) : 0);
+  breakdown.structuredAnswers = a.structuredBlocks >= 2 ? W.structuredAnswers
+    : (a.structuredBlocks >= 1 ? part(W.structuredAnswers, 0.5) : 0);
   const hasArticleSchema = a.schemaTypes.some(t => t === 'Article' || t === 'BlogPosting');
   const hasAuthor = a.schemaTypes.includes('Person');
   const hasFaqSchema = a.schemaTypes.includes('FAQPage');
-  breakdown.schemaReadiness = hasArticleSchema && hasAuthor ? (hasFaqSchema ? 10 : 4) : 0;
-  breakdown.uniqueAngle = a.uniqueAngle && a.uniqueAngle.length > 10 ? 10
-    : (a.angle && a.angle.length > 10 ? 10 : 0);
-  breakdown.wordCount = a.wordCount >= 2000 ? 10 : (a.wordCount >= 1500 ? 5 : 0);
-  const full = { directAnswer: 15, entityDensity: 15, factDensity: 15, faq: 15, structuredAnswers: 10, schemaReadiness: 10, uniqueAngle: 10, wordCount: 10 };
-  for (const [k, v] of Object.entries(breakdown)) if (v < full[k]) failed.push(k);
+  breakdown.schemaReadiness = hasArticleSchema && hasAuthor
+    ? (hasFaqSchema ? W.schemaReadiness : part(W.schemaReadiness, 0.4)) : 0;
+  breakdown.uniqueAngle = (a.uniqueAngle && a.uniqueAngle.length > 10) || (a.angle && a.angle.length > 10)
+    ? W.uniqueAngle : 0;
+  breakdown.wordCount = a.wordCount >= 2000 ? W.wordCount : (a.wordCount >= 1500 ? part(W.wordCount, 0.5) : 0);
+  // Semantic relationship links: every internal link must explain HOW the two
+  // pieces relate — a conceptual bridge, not bare anchor text.
+  const links = a.internalLinks || [];
+  const withContext = links.filter(l => typeof l === 'object' && l.context && l.context.length >= 40).length;
+  breakdown.semanticLinks = links.length && withContext === links.length ? W.semanticLinks
+    : (withContext > 0 ? part(W.semanticLinks, 0.5) : 0);
+  // Topical coherence: the article belongs to a cluster and links stay inside it.
+  const sameCluster = links.filter(l => typeof l === 'object' && l.sameCluster).length;
+  breakdown.topicalCoherence = a.clusterId && sameCluster >= 2 ? W.topicalCoherence
+    : (a.clusterId && sameCluster >= 1 ? part(W.topicalCoherence, 0.5) : 0);
+
+  for (const [k, v] of Object.entries(breakdown)) if (v < W[k]) failed.push(k);
   const total = Object.values(breakdown).reduce((s, v) => s + v, 0);
   return { total, breakdown, failed };
+}
+
+// Contradiction check v1 (July update §4). Two tiers:
+//  - vs the pipeline's own published corpus: severe conflicts BLOCK the draft
+//    (we must never disagree with ourselves — that is the Signal Clarity
+//    consistency requirement).
+//  - vs legacy baseline pages: advisory only. Legacy conflicts are a property
+//    of the old content, already flagged by the baseline audit and the plan;
+//    the remedy is updating/removing the legacy page, not blocking new work.
+function contradictionCheck(client, article) {
+  const draftLabel = `draft:${article.slug}`;
+  const mine = (c) => c.a.label === draftLabel || c.b.label === draftLabel;
+  const published = client.articles
+    .filter(x => x.publishedUrl && x.id !== article.id)
+    .map(x => ({ label: x.slug, facts: x.facts }));
+  const legacy = (client.baseline ? client.baseline.pages : [])
+    .map(p => ({ label: p.url, facts: p.facts }));
+  const draft = { label: draftLabel, facts: article.facts };
+  const vsPublished = mock.findContradictions(published.concat([draft])).filter(mine);
+  const vsLegacy = mock.findContradictions(legacy.concat([draft])).filter(mine);
+  return {
+    severe: vsPublished.filter(c => c.severe),
+    advisory: vsPublished.filter(c => !c.severe).concat(vsLegacy)
+  };
 }
 
 // ---- Agent 5: Publish ----------------------------------------------------------
@@ -646,29 +994,75 @@ function publish(client) {
     return { agent: 'publish', status: 'FAIL', summary: 'No approved articles to publish.' };
   }
   // crawl accessibility check comes first — publishing to a site AI crawlers
-  // cannot read is wasted work
+  // cannot read is wasted work (all six required bots, July update §2.3)
   const crawl = mock.crawlCheck(client);
   if (!crawl.ok) {
     return {
       agent: 'publish', status: 'ESCALATE_TO_HUMAN',
       summary: `robots.txt blocks AI crawlers (${crawl.blocked.join(', ')}). Nothing published.`,
-      escalation: { reason: `robots.txt blocks required AI crawlers: ${crawl.blocked.join(', ')}` }
+      escalations: [{ reason: `robots.txt blocks required AI crawlers: ${crawl.blocked.join(', ')}` }]
     };
   }
+
   const urls = [];
+  const held = [];
+  const escalations = [];
+  let webhookFailures = 0, verificationFailures = 0;
+
   for (const a of approved) {
-    a.publishedAt = now();
-    const post = mock.wpUpsertPost(client, a);
+    // Symmetry gate (July update §1.4): JSON-LD must match the DOM exactly.
+    // A mismatch is an ambiguous signal — flag it before the page goes live.
+    const sym = mock.symmetryCheck(a);
+    if (!sym.ok) {
+      a.status = 'draft';
+      a.feedback = { source: 'publish', failed: ['symmetryGate'], note: sym.mismatches.join('; ') };
+      held.push({ slug: a.slug, mismatches: sym.mismatches });
+      continue;
+    }
+
+    a.publishedAt = a.publishedAt || now();
+    const post = mock.wpUpsertPost(client, a);   // published but NOT in navigation
     a.publishedUrl = post.url;
     a.status = 'published';
+    if (!a.visibility) a.visibility = 'hidden';  // republish keeps an earned 'visible'
     urls.push(post.url);
+
+    // Webhook confirmation: the plugin must confirm the post is live.
+    const hook = mock.webhookConfirm(client, a);
+    a.webhookStatus = hook.confirmed ? 'confirmed' : 'pending';
+    if (!hook.confirmed) {
+      webhookFailures++;
+      escalations.push({ reason: `No publish-confirmation webhook received for "${a.title}" — post may not be live on the client site.`, articleId: a.id });
+    }
+
+    // Post-publish verification: 200 + full article present as static HTML.
+    const check = mock.verifyPublished(client, a);
+    a.verification = check;
+    if (!check.ok) {
+      verificationFailures++;
+      escalations.push({ reason: `Published page failed crawl verification for "${a.title}": ${Object.entries(check.checks).filter(([, v]) => !v).map(([k]) => k).join(', ')}.`, articleId: a.id });
+    }
   }
-  client.wp.llmsTxt = mock.renderLlmsTxt(client); // updated after every publication
-  mock.ping(client, 'indexnow', urls);            // Bing / Yandex / Naver
-  mock.ping(client, 'gsc', urls);                 // Google Search Console
+
+  if (urls.length) {
+    client.wp.llmsTxt = mock.renderLlmsTxt(client);   // updated after every publication
+    client.wp.sitemap = mock.renderSitemap(client);   // clustered, pillar first
+    mock.ping(client, 'indexnow', urls);              // Bing / Yandex / Naver
+    mock.ping(client, 'gsc', urls);                   // Google Search Console
+  }
+
+  const bits = [`${urls.length} articles live as hidden posts (sitemap + llms.txt discovery, not in navigation)`];
+  if (held.length) bits.push(`${held.length} held by the symmetry gate and returned to the writer`);
+  if (webhookFailures) bits.push(`${webhookFailures} without publish confirmation`);
+  if (verificationFailures) bits.push(`${verificationFailures} failed static-HTML verification`);
+  const status = (webhookFailures || verificationFailures) ? 'ESCALATE_TO_HUMAN'
+    : held.length ? 'NEEDS_REVIEW'
+    : urls.length ? 'PASS' : 'FAIL';
   return {
-    agent: 'publish', status: 'PASS',
-    summary: `${approved.length} articles live with metadata + schema. llms.txt updated (${client.wp.posts.length} pages). IndexNow and Search Console pinged.`
+    agent: 'publish', status,
+    summary: bits.join('; ') + '.',
+    ...(escalations.length ? { escalations } : {}),
+    data: { held }
   };
 }
 
@@ -692,6 +1086,17 @@ function monitor(client) {
     }
     return { articleId: a.id, slug: a.slug, title: a.title, engines };
   });
+
+  // Query-citation ownership: per query per engine — client, competitor, or
+  // NOBODY. Queries nobody owns are citation whitespace: the cheapest wins.
+  const queryCitations = client.plan.prioritizedArticles.map(k => {
+    const engines = {};
+    for (const e of mock.ENGINES) engines[e] = mock.queryCitationOwner(client, k.keyword, e, run);
+    return { query: k.keyword, engines };
+  });
+  const whitespace = queryCitations
+    .filter(row => Object.values(row.engines).filter(v => v === null).length >= 2)
+    .map(row => ({ query: row.query, type: 'whitespace' }));
 
   // drop detection: cited→uncited per engine, or ranking drop > sensitivity
   const droppedPages = [];
@@ -719,6 +1124,29 @@ function monitor(client) {
     if (art) art.status = 'flagged';
   }
 
+  // Hidden-post traffic thresholds (July update §2.1): when a hidden article
+  // crosses the visitor threshold, notify the client so they can choose to
+  // make it publicly visible. One notification per article.
+  const visitors = published.map(a => ({
+    articleId: a.id, slug: a.slug,
+    visitors: mock.articleVisitors(client.id, a.slug, run)
+  }));
+  const newNotifications = [];
+  for (const v of visitors) {
+    const art = client.articles.find(a => a.id === v.articleId);
+    if (!art || art.visibility !== 'hidden') continue;
+    if (v.visitors < client.thresholds.visitorThreshold) continue;
+    if (client.notifications.some(n => n.articleId === art.id)) continue;
+    const n = {
+      id: uid('notif'), articleId: art.id, slug: art.slug, title: art.title,
+      type: 'traffic_threshold', visitors: v.visitors,
+      windowDays: client.thresholds.visitorWindowDays,
+      status: 'pending', createdAt: now()
+    };
+    client.notifications.push(n);
+    newNotifications.push(n);
+  }
+
   const report = {
     id: uid('rep'),
     week: run,
@@ -727,6 +1155,9 @@ function monitor(client) {
     keywords,
     ga4: mock.ga4Data(client.id, run),
     citations,
+    queryCitations,
+    whitespace,
+    visitors,
     botVisits: mock.botVisits(client.id, run),
     droppedPages,
     newGaps: mock.impressionGaps(client.niche, run)
@@ -737,7 +1168,8 @@ function monitor(client) {
   return {
     agent: 'monitor', status: 'NEEDS_REVIEW',
     summary: `Weekly report #${run}: ${citedCount}/${citations.length * mock.ENGINES.length} engine citations, ` +
-      `${droppedPages.length} dropped pages flagged, ${report.newGaps.length} new gaps found. Pending specialist review.`
+      `${droppedPages.length} dropped pages flagged, ${whitespace.length} whitespace queries (nobody cited), ` +
+      `${report.newGaps.length} new gaps, ${newNotifications.length} traffic-threshold notifications. Pending specialist review.`
   };
 }
 
@@ -760,9 +1192,15 @@ function optimize(client) {
       a: 'This page was refreshed with updated statistics, extended FAQ coverage and reinforced internal links after a citation drop was detected.'
     }]);
     if (!a.schemaTypes.includes('FAQPage')) a.schemaTypes.push('FAQPage');
-    a.facts = a.facts.map(f => ({ ...f, year: Math.max(f.year, new Date().getFullYear() - 1) }));
-    const extraLink = a.internalLinks.length < 5 ? [slugify(client.niche)] : [];
-    a.internalLinks = a.internalLinks.concat(extraLink);
+    a.facts = a.facts.map(f => ({ ...f, year: Math.max(f.year || 0, new Date().getFullYear() - 1) }));
+    if (a.internalLinks.length < 5) {
+      const target = slugify(client.niche);
+      a.internalLinks = a.internalLinks.concat([{
+        target,
+        context: `The wider context for this refresh sits in our overview of ${client.niche}, which frames where ${a.keyword} fits in the broader operating decisions a team makes.`,
+        sameCluster: false
+      }]);
+    }
     a.version += 1;
     a.optimizedAt = now();
     a.status = 'published';
@@ -772,38 +1210,49 @@ function optimize(client) {
   }
   if (urls.length) {
     client.wp.llmsTxt = mock.renderLlmsTxt(client);
+    client.wp.sitemap = mock.renderSitemap(client);
     mock.ping(client, 'indexnow', urls);
     mock.ping(client, 'gsc', urls);
   }
-  // feed newly identified gaps back to Agent 1 — closes the loop
+  // feed newly identified gaps AND citation whitespace back to Agent 1 —
+  // closes the loop; whitespace queries are the cheapest wins in the niche
   const gaps = latest.newGaps || [];
+  const whitespace = latest.whitespace || [];
   client.pendingGaps.push(...gaps);
-  client.optimizationLog.push({ ts: now(), reportId: latest.id, pages: log, gapsFedBack: gaps.length });
+  client.pendingGaps.push(...whitespace.map(w => ({ query: w.query, impressions: 150, type: 'whitespace' })));
+  client.optimizationLog.push({
+    ts: now(), reportId: latest.id, pages: log,
+    gapsFedBack: gaps.length + whitespace.length
+  });
   return {
     agent: 'optimize', status: 'PASS',
-    summary: `${log.length} flagged pages optimized and republished; ${gaps.length} content gaps fed back to Research.`,
+    summary: `${log.length} flagged pages optimized and republished; ${gaps.length} content gaps and ` +
+      `${whitespace.length} whitespace queries fed back to Research.`,
     data: { log }
   };
 }
 
-module.exports = { research, brief, writer, scoreArticle, publish, monitor, optimize };
+module.exports = { baseline, research, brief, writer, scoreArticle, contradictionCheck, publish, monitor, optimize, RUBRIC_WEIGHTS };
 
 });
 
 __define('orchestrator', function (module, exports, require) {
 'use strict';
 // Orchestration layer: client lifecycle, stage running, human gates,
-// quality→writer retry loop, escalations, and the central audit log.
+// quality→writer retry loop, escalations, visibility decisions, and the
+// central audit log.
 const agents = require('./agents');
 const mock = require('./adapters/mock');
 const { uid, now } = require('./util');
 
-const STAGES = ['research', 'brief', 'writer', 'quality', 'publish', 'monitor', 'optimize', 'full'];
+const STAGES = ['baseline', 'research', 'brief', 'writer', 'quality', 'publish', 'monitor', 'optimize', 'full'];
 
 const DEFAULT_THRESHOLDS = {
-  qualityMin: 85,        // Quality Agent minimum GEO score
+  qualityMin: 85,        // Quality Agent minimum Signal Clarity score
   maxWriterAttempts: 3,  // rewrites before ESCALATE_TO_HUMAN
-  dropSensitivity: 5     // ranking positions lost before a page is flagged
+  dropSensitivity: 5,    // ranking positions lost before a page is flagged
+  visitorThreshold: 5,   // visitors that trigger a visibility notification
+  visitorWindowDays: 7   // window for the visitor threshold
 };
 
 function audit(client, agent, status, summary, detail) {
@@ -842,64 +1291,102 @@ function createClient(store, input) {
     reviewMode: input.reviewMode === 'client_review' ? 'client_review' : 'auto',
     thresholds: { ...DEFAULT_THRESHOLDS, ...(input.thresholds || {}) },
     simulateRobotsBlock: !!input.simulateRobotsBlock,
+    simulateWebhookFailure: !!input.simulateWebhookFailure,
     createdAt: now(),
+    baseline: null,
     plan: null,
     briefs: [],
     articles: [],
     reports: [],
+    notifications: [],
     escalations: [],
     optimizationLog: [],
     pendingGaps: [],
     monitorRuns: 0,
     audit: [],
-    wp: { posts: [], llmsTxt: '', pings: [] }
+    wp: { posts: [], llmsTxt: '', sitemap: '', pings: [] }
   };
   audit(client, 'system', 'INFO', `Client onboarded (${client.reviewMode} mode). Plugin API key issued.`);
   store.addClient(client);
+  // Agent 0 runs before any engagement: the baseline is the before/after
+  // evidence base, and the robots audit catches blocked crawlers on day one.
+  const base = agents.baseline(client);
+  audit(client, 'baseline', base.status, base.summary);
+  if (base.status === 'ESCALATE_TO_HUMAN' && base.escalation) {
+    escalate(client, 'baseline', base.escalation.reason);
+  }
+  store.save();
   return client;
 }
 
 // Quality stage with the retry loop: below threshold → back to Writer with
-// failed criteria, up to maxWriterAttempts, then ESCALATE_TO_HUMAN.
+// failed criteria, up to maxWriterAttempts, then ESCALATE_TO_HUMAN. Also the
+// contradiction gate: severe conflicts with the live corpus block the draft.
 function runQuality(client) {
   const drafts = client.articles.filter(a => a.status === 'draft');
   if (!drafts.length) return { agent: 'quality', status: 'FAIL', summary: 'No drafts to score.' };
-  const { qualityMin, maxWriterAttempts } = client.thresholds;
-  let approved = 0, gated = 0, escalated = 0, retries = 0;
+  const { qualityMin, maxWriterAttempts, rubricWeights } = client.thresholds;
+  let approved = 0, gated = 0, escalated = 0, retries = 0, contradictionsFound = 0;
+
+  // Semantic-link contexts are a hard requirement (July update §1.5: every
+  // internal link MUST explain how the pieces relate), independent of score.
+  const bareLinks = (a) => (a.internalLinks || [])
+    .some(l => typeof l !== 'object' || !l.context || l.context.length < 40);
 
   for (const a of drafts) {
-    let result = agents.scoreArticle(a);
-    while (result.total < qualityMin && a.attempt < maxWriterAttempts) {
+    let result = agents.scoreArticle(a, rubricWeights);
+    while ((result.total < qualityMin || bareLinks(a)) && a.attempt < maxWriterAttempts) {
+      const failed = result.failed.concat(bareLinks(a) && !result.failed.includes('semanticLinks') ? ['semanticLinks'] : []);
       audit(client, 'quality', 'FAIL',
-        `"${a.title}" scored ${result.total}/${qualityMin} — returned to writer (attempt ${a.attempt}). Failed: ${result.failed.join(', ')}`);
+        `"${a.title}" scored ${result.total}/${qualityMin} — returned to writer (attempt ${a.attempt}). Failed: ${failed.join(', ')}`);
       const brief = client.briefs.find(b => b.id === a.briefId);
       const redraft = mock.rewriteArticle(client, brief, a, result.failed);
       Object.assign(a, redraft);
       retries++;
-      result = agents.scoreArticle(a);
+      result = agents.scoreArticle(a, rubricWeights);
     }
     a.score = result.total;
     a.scoreBreakdown = result.breakdown;
-    if (result.total >= qualityMin) {
-      if (client.reviewMode === 'client_review') {
-        a.status = 'pending_client_review';
-        gated++;
-      } else {
-        a.status = 'approved';
-        approved++;
-      }
-    } else {
+    if (result.total < qualityMin || bareLinks(a)) {
       a.status = 'escalated';
       escalated++;
       escalate(client, 'quality',
         `"${a.title}" scored ${result.total}/${qualityMin} after ${a.attempt} attempts. Failed: ${result.failed.join(', ')}`,
         a.id);
+      continue;
+    }
+    // Contradiction check v1: the draft must not disagree with what is
+    // already live (published corpus + legacy baseline pages).
+    const contra = agents.contradictionCheck(client, a);
+    a.contradictions = contra;
+    if (contra.severe.length) {
+      contradictionsFound++;
+      a.status = 'escalated';
+      escalated++;
+      const c = contra.severe[0];
+      escalate(client, 'quality',
+        `"${a.title}" contradicts existing content: ${c.subject} claimed as ${c.a.value}% in ${c.a.label} vs ${c.b.value}% in ${c.b.label}. Update or remove one.`,
+        a.id);
+      continue;
+    }
+    if (contra.advisory.length) {
+      audit(client, 'quality', 'INFO',
+        `"${a.title}": ${contra.advisory.length} minor fact variance(s) vs existing content recorded (advisory).`);
+    }
+    if (client.reviewMode === 'client_review') {
+      a.status = 'pending_client_review';
+      gated++;
+    } else {
+      a.status = 'approved';
+      approved++;
     }
   }
 
   const summary = `${drafts.length} drafts scored (threshold ${qualityMin}): ` +
     `${approved} approved, ${gated} sent to client review, ${escalated} escalated` +
-    (retries ? `, ${retries} rewrites in the retry loop` : '') + '.';
+    (retries ? `, ${retries} rewrites in the retry loop` : '') +
+    (contradictionsFound ? `, ${contradictionsFound} blocked by the contradiction check` : '') +
+    '. Contradiction check ran against the live corpus.';
   const status = escalated ? 'ESCALATE_TO_HUMAN' : (gated ? 'NEEDS_REVIEW' : 'PASS');
   return { agent: 'quality', status, summary };
 }
@@ -907,16 +1394,12 @@ function runQuality(client) {
 function runSingleStage(store, client, stage) {
   let out;
   switch (stage) {
+    case 'baseline': out = agents.baseline(client); break;
     case 'research': out = agents.research(client); break;
     case 'brief': out = agents.brief(client); break;
     case 'writer': out = agents.writer(client); break;
     case 'quality': out = runQuality(client); break;
-    case 'publish':
-      out = agents.publish(client);
-      if (out.status === 'ESCALATE_TO_HUMAN' && out.escalation) {
-        escalate(client, 'publish', out.escalation.reason);
-      }
-      break;
+    case 'publish': out = agents.publish(client); break;
     case 'monitor': out = agents.monitor(client); break;
     case 'optimize': out = agents.optimize(client); break;
     default: {
@@ -925,14 +1408,17 @@ function runSingleStage(store, client, stage) {
       throw err;
     }
   }
-  if (!(stage === 'publish' && out.status === 'ESCALATE_TO_HUMAN')) {
-    audit(client, out.agent, out.status, out.summary);
-  }
+  audit(client, out.agent, out.status, out.summary);
+  // agents report escalations declaratively; the orchestrator owns the queue
+  const escs = out.escalations || (out.escalation ? [out.escalation] : []);
+  for (const e of escs) escalate(client, out.agent, e.reason, e.articleId);
   return out;
 }
 
 // Full pipeline: Research → Brief → Writer → Quality → Publish, halting at
-// any human gate. Monitor/Optimize run on their own (weekly) cadence.
+// any human gate. When the symmetry gate holds articles back, one bounded
+// second Writer → Quality → Publish pass gets them live. Monitor/Optimize
+// run on their own (weekly) cadence.
 function runFull(store, client) {
   if (!client.plan || client.plan.status === 'rejected' || client.pendingGaps.length) {
     const r = runSingleStage(store, client, 'research');
@@ -942,22 +1428,31 @@ function runFull(store, client) {
     return { agent: 'pipeline', status: 'NEEDS_REVIEW', summary: 'Halted at plan gate — content plan pending specialist approval.' };
   }
   if (!client.briefs.length) runSingleStage(store, client, 'brief');
-  runSingleStage(store, client, 'writer');
-  if (client.articles.some(a => a.status === 'draft')) {
-    const q = runSingleStage(store, client, 'quality');
-    if (q.status === 'ESCALATE_TO_HUMAN') {
-      return { agent: 'pipeline', status: 'ESCALATE_TO_HUMAN', summary: `Halted — ${q.summary}` };
+
+  for (let pass = 1; pass <= 2; pass++) {
+    runSingleStage(store, client, 'writer');
+    if (client.articles.some(a => a.status === 'draft')) {
+      const q = runSingleStage(store, client, 'quality');
+      if (q.status === 'ESCALATE_TO_HUMAN') {
+        return { agent: 'pipeline', status: 'ESCALATE_TO_HUMAN', summary: `Halted — ${q.summary}` };
+      }
+      if (q.status === 'NEEDS_REVIEW') {
+        return { agent: 'pipeline', status: 'NEEDS_REVIEW', summary: `Halted at client review gate — ${q.summary}` };
+      }
     }
-    if (q.status === 'NEEDS_REVIEW') {
-      return { agent: 'pipeline', status: 'NEEDS_REVIEW', summary: `Halted at client review gate — ${q.summary}` };
+    if (!client.articles.some(a => a.status === 'approved')) {
+      return { agent: 'pipeline', status: 'NEEDS_REVIEW', summary: 'Halted — no approved articles to publish (check reviews/escalations).' };
     }
+    const p = runSingleStage(store, client, 'publish');
+    if (p.status === 'ESCALATE_TO_HUMAN' || p.status === 'FAIL') {
+      return { agent: 'pipeline', status: p.status, summary: `Halted at publish — ${p.summary}` };
+    }
+    // symmetry holds → drafts with feedback exist → one more pass fixes them
+    const heldDrafts = client.articles.some(a => a.status === 'draft' && a.feedback &&
+      (a.feedback.failed || []).includes('symmetryGate'));
+    if (!heldDrafts) break;
   }
-  if (!client.articles.some(a => a.status === 'approved')) {
-    return { agent: 'pipeline', status: 'NEEDS_REVIEW', summary: 'Halted — no approved articles to publish (check reviews/escalations).' };
-  }
-  const p = runSingleStage(store, client, 'publish');
-  if (p.status !== 'PASS') return { agent: 'pipeline', status: p.status, summary: `Halted at publish — ${p.summary}` };
-  return { agent: 'pipeline', status: 'PASS', summary: `Full pipeline complete: ${client.articles.filter(a => a.status === 'published').length} articles live.` };
+  return { agent: 'pipeline', status: 'PASS', summary: `Full pipeline complete: ${client.articles.filter(a => a.status === 'published').length} articles live (hidden until traffic threshold).` };
 }
 
 function runStage(store, clientId, stage) {
@@ -995,6 +1490,46 @@ function articleDecision(store, clientId, articleId, decision) {
   return article;
 }
 
+// Hidden-post lifecycle (July update §2.1): after the traffic-threshold
+// notification, the client decides whether the post enters site navigation.
+function visibilityDecision(store, clientId, articleId, decision, actor) {
+  const client = store.getClient(clientId);
+  const article = client && client.articles.find(a => a.id === articleId);
+  if (!article) { const e = new Error('Article not found'); e.status = 404; throw e; }
+  if (!['make_visible', 'keep_hidden'].includes(decision)) {
+    const e = new Error('decision must be make_visible|keep_hidden'); e.status = 400; throw e;
+  }
+  if (decision === 'make_visible') {
+    article.visibility = 'visible';
+    const post = client.wp.posts.find(p => p.slug === article.slug);
+    if (post) post.inNavigation = true;
+  }
+  const notif = client.notifications.find(n => n.articleId === articleId && n.status === 'pending');
+  if (notif) {
+    notif.status = 'decided';
+    notif.decision = decision;
+    notif.decidedAt = now();
+  }
+  audit(client, actor || 'client', 'INFO',
+    `Visibility decision for "${article.title}": ${decision === 'make_visible' ? 'now publicly visible (in navigation)' : 'kept hidden (sitemap-only)'}.`);
+  store.save();
+  return article;
+}
+
+// Webhook from the WordPress plugin confirming a post is live.
+function publishConfirmation(store, clientId, articleId) {
+  const client = store.getClient(clientId);
+  const article = client && client.articles.find(a => a.id === articleId);
+  if (!article) { const e = new Error('Article not found'); e.status = 404; throw e; }
+  article.webhookStatus = 'confirmed';
+  const esc = client.escalations.find(e =>
+    e.status === 'open' && e.articleId === articleId && /webhook/i.test(e.reason));
+  if (esc) { esc.status = 'resolved'; esc.resolution = 'webhook_received'; esc.resolvedAt = now(); }
+  audit(client, 'plugin', 'INFO', `Publish confirmation received for "${article.title}".`);
+  store.save();
+  return article;
+}
+
 function reportDecision(store, clientId, reportId, decision) {
   const client = store.getClient(clientId);
   const report = client && client.reports.find(r => r.id === reportId);
@@ -1014,9 +1549,9 @@ function resolveEscalation(store, clientId, escalationId, action) {
   if (!actions.includes(action)) { const e = new Error(`action must be ${actions.join('|')}`); e.status = 400; throw e; }
   const article = esc.articleId ? client.articles.find(a => a.id === esc.articleId) : null;
   if (article) {
-    if (action === 'force_approve') article.status = 'approved';
+    if (action === 'force_approve') article.status = article.publishedUrl ? article.status : 'approved';
     if (action === 'rewrite') { article.status = 'draft'; article.feedback = { source: 'human', failed: [], note: 'human requested rewrite' }; }
-    if (action === 'dismiss') article.status = 'rejected';
+    if (action === 'dismiss' && !article.publishedUrl) article.status = 'rejected';
   }
   esc.status = 'resolved';
   esc.resolution = action;
@@ -1039,6 +1574,7 @@ function updateSettings(store, clientId, input) {
   }
   if (input.brandVoice) client.brandVoice = input.brandVoice;
   if (typeof input.simulateRobotsBlock === 'boolean') client.simulateRobotsBlock = input.simulateRobotsBlock;
+  if (typeof input.simulateWebhookFailure === 'boolean') client.simulateWebhookFailure = input.simulateWebhookFailure;
   audit(client, 'system', 'INFO', 'Settings updated.');
   store.save();
   return client;
@@ -1046,7 +1582,8 @@ function updateSettings(store, clientId, input) {
 
 module.exports = {
   STAGES, DEFAULT_THRESHOLDS, createClient, runStage,
-  planDecision, articleDecision, reportDecision, resolveEscalation, updateSettings
+  planDecision, articleDecision, visibilityDecision, publishConfirmation,
+  reportDecision, resolveEscalation, updateSettings
 };
 
 });
@@ -1081,6 +1618,12 @@ function demoReset() {
 function __esc(s) { return String(s).replace(/[&<>"]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m])); }
 
 function __postPage(client, post) {
+  const links = (post.internalLinks || []).length
+    ? '<h2>Related reading</h2>' + post.internalLinks.map(l =>
+        `<p>${__esc(l.context || '')} <em>${__esc(String(l.target).replace(/-/g, ' '))}</em></p>`).join('\n') : '';
+  return __postPageInner(client, post, links);
+}
+function __postPageInner(client, post, links) {
   const schema = post.schema.map(s =>
     `<script type="application/ld+json">${JSON.stringify({ '@context': 'https://schema.org', ...s })}<\/script>`).join('\n');
   const body = post.body.map(s => `<h2>${__esc(s.heading)}</h2><p>${__esc(s.content)}</p>`).join('\n');
@@ -1091,8 +1634,8 @@ function __postPage(client, post) {
 <link rel="canonical" href="${__esc(post.canonical)}">
 ${schema}
 <style>body{font-family:Georgia,serif;max-width:720px;margin:2rem auto;padding:0 1rem;color:#222}h1{font-size:1.6rem}</style>
-</head><body><p><em>Mock WordPress site for ${__esc(client.name)} — v${post.version}</em></p>
-<h1>${__esc(post.title)}</h1>${body}${faq}</body></html>`;
+</head><body><p><em>Mock WordPress site for ${__esc(client.name)} — v${post.version} · ${post.inNavigation ? 'in site navigation' : 'hidden post (sitemap-only discovery)'}</em></p>
+<h1>${__esc(post.title)}</h1>${body}${links}${faq}</body></html>`;
 }
 
 function __route(method, pathname, body) {
@@ -1117,6 +1660,9 @@ function __route(method, pathname, body) {
     if ((x = m(/^\/api\/clients\/([^/]+)\/articles\/([^/]+)\/decision$/)) && method === 'POST') {
       return { status: 200, body: __orch.articleDecision(__store, x[1], x[2], body.decision) };
     }
+    if ((x = m(/^\/api\/clients\/([^/]+)\/articles\/([^/]+)\/visibility$/)) && method === 'POST') {
+      return { status: 200, body: __orch.visibilityDecision(__store, x[1], x[2], body.decision, 'operator') };
+    }
     if ((x = m(/^\/api\/clients\/([^/]+)\/reports\/([^/]+)\/decision$/)) && method === 'POST') {
       return { status: 200, body: __orch.reportDecision(__store, x[1], x[2], body.decision) };
     }
@@ -1130,6 +1676,10 @@ function __route(method, pathname, body) {
     if ((x = m(/^\/mock-wp\/([^/]+)\/robots\.txt$/))) {
       const c = __store.getClient(x[1]);
       return { status: 200, body: c ? __mock.robotsTxt(c) : 'not found', type: 'text/plain' };
+    }
+    if ((x = m(/^\/mock-wp\/([^/]+)\/sitemap\.xml$/))) {
+      const c = __store.getClient(x[1]);
+      return { status: 200, body: c ? __mock.renderSitemap(c) : 'not found', type: 'text/plain' };
     }
     if ((x = m(/^\/mock-wp\/([^/]+)\/posts\/([^/]+)$/))) {
       const c = __store.getClient(x[1]);
@@ -1264,6 +1814,8 @@ async function act(fn, okMsg) {
 window.runStage = (stage) => act(() => api('POST', `/api/clients/${state.selId}/run/${stage}`));
 window.planDecide = (d) => act(() => api('POST', `/api/clients/${state.selId}/plan/decision`, { decision: d }), `Plan ${d}d`);
 window.articleDecide = (aid, d) => act(() => api('POST', `/api/clients/${state.selId}/articles/${aid}/decision`, { decision: d }), `Article ${d}`);
+window.visibilityDecide = (aid, d) => act(() => api('POST', `/api/clients/${state.selId}/articles/${aid}/visibility`, { decision: d }),
+  d === 'make_visible' ? 'Post is now publicly visible (in navigation)' : 'Post kept hidden (sitemap-only)');
 window.reportDecide = (rid) => act(() => api('POST', `/api/clients/${state.selId}/reports/${rid}/decision`, { decision: 'approve' }), 'Report approved — optimization unlocked');
 window.resolveEsc = (eid, action) => act(() => api('POST', `/api/clients/${state.selId}/escalations/${eid}/resolve`, { action }), `Escalation resolved: ${action}`);
 window.selectClient = (id) => { state.selId = id; state.view = 'client'; state.tab = 'pipeline'; render(); };
@@ -1281,8 +1833,8 @@ window.submitOnboard = async (ev) => {
       keywords: split(f.keywords.value), competitors: split(f.competitors.value),
       brandVoice: f.brandVoice.value, reviewMode: f.reviewMode.value
     });
-    state.selId = client.id; state.view = 'client'; state.tab = 'pipeline';
-    toast(`Client "${client.name}" onboarded. Plugin API key: ${client.apiKey}`);
+    state.selId = client.id; state.view = 'client'; state.tab = 'baseline';
+    toast(`Client "${client.name}" onboarded — baseline audit recorded. Plugin API key: ${client.apiKey}`);
     await refresh();
   } catch (e) { toast(e.message, 'FAIL'); }
   return false;
@@ -1295,10 +1847,13 @@ window.saveSettings = async (ev) => {
     thresholds: {
       qualityMin: +f.qualityMin.value,
       maxWriterAttempts: +f.maxWriterAttempts.value,
-      dropSensitivity: +f.dropSensitivity.value
+      dropSensitivity: +f.dropSensitivity.value,
+      visitorThreshold: +f.visitorThreshold.value,
+      visitorWindowDays: +f.visitorWindowDays.value
     },
     reviewMode: f.reviewMode.value,
-    simulateRobotsBlock: f.simulateRobotsBlock.checked
+    simulateRobotsBlock: f.simulateRobotsBlock.checked,
+    simulateWebhookFailure: f.simulateWebhookFailure.checked
   }), 'Settings saved');
   return false;
 };
@@ -1306,23 +1861,43 @@ window.saveSettings = async (ev) => {
 window.viewArticle = (aid) => {
   const a = sel().articles.find(x => x.id === aid);
   if (!a) return;
+  const links = (a.internalLinks || []).map(l => typeof l === 'object' ? l : { target: l, context: '', sameCluster: false });
+  const symmetryOk = a.schemaHeadline === a.title;
   $('#modal').innerHTML = `
     <h1>${esc(a.title)}</h1>
-    <p class="dim">${badge(a.status)} score ${a.score ?? '—'} · attempt ${a.attempt} · v${a.version} · ${a.wordCount} words</p>
+    <p class="dim">${badge(a.status)} ${a.publishedUrl ? badge(a.visibility || 'hidden') : ''} score ${a.score ?? '—'} · attempt ${a.attempt} · v${a.version} · ${a.wordCount} words</p>
     <h2>Direct answer (citation snippet)</h2><p>${esc(a.directAnswer)}</p>
-    <h2>Score breakdown</h2>
+    <h2>Score breakdown (Signal Clarity rubric v2)</h2>
     ${a.scoreBreakdown ? `<pre data-testid="score-breakdown">${esc(JSON.stringify(a.scoreBreakdown, null, 2))}</pre>` : '<p class="dim">Not scored yet.</p>'}
+    <h2>Symmetry (DOM ↔ JSON-LD)</h2>
+    <p class="dim" data-testid="symmetry-state">${symmetryOk
+      ? '✓ JSON-LD headline matches the H1.'
+      : `⚠ JSON-LD headline "${esc(a.schemaHeadline)}" ≠ H1 "${esc(a.title)}" — the publish symmetry gate will hold this.`}</p>
+    <h2>Semantic relationship links (${links.length})</h2>
+    ${links.map(l => `<p class="dim" data-testid="semantic-link">→ <span class="mono">${esc(l.target)}</span>${l.sameCluster ? ' <span class="badge b-low">same cluster</span>' : ''}<br>${l.context ? esc(l.context) : '<em>⚠ no conceptual bridge — bare link</em>'}</p>`).join('')}
     <h2>Structure</h2>
     <p class="dim">Headings: ${a.sections.map(s => esc(s.heading)).join(' · ')}</p>
     <p class="dim">Entities (${a.entities.length}): ${a.entities.map(esc).join(', ')}</p>
     <p class="dim">Facts (${a.facts.length}): e.g. “${esc(a.facts[0].claim)}” — ${esc(a.facts[0].source)}, ${a.facts[0].year}</p>
     <p class="dim">FAQ: ${a.faq.length} questions · Schema: ${a.faq.length ? '' : '(no FAQPage) '}${a.schemaTypes.map(esc).join(', ')}</p>
-    <p class="dim">Internal links: ${a.internalLinks.map(esc).join(', ')}</p>
-    <p class="dim">Unique angle: ${esc(a.angle)}</p>
-    ${a.publishedUrl ? `<p><a href="${esc(a.publishedUrl)}" target="_blank" style="color:var(--accent2)">View live page →</a></p>` : ''}
+    <p class="dim">Unique Information Delta: ${esc(a.angle)}</p>
+    ${a.contradictions && (a.contradictions.severe.length + a.contradictions.advisory.length) ? `
+      <h2>Contradiction check</h2>
+      ${a.contradictions.severe.map(c => `<p data-testid="contradiction-severe">⛔ ${esc(c.subject)}: ${c.a.value}% (${esc(c.a.label)}) vs ${c.b.value}% (${esc(c.b.label)})</p>`).join('')}
+      ${a.contradictions.advisory.map(c => `<p class="dim">△ minor variance on ${esc(c.subject)}: ${c.a.value}% vs ${c.b.value}%</p>`).join('')}` : ''}
+    ${a.publishedUrl ? `
+      <h2>Publication</h2>
+      <p class="dim" data-testid="pub-state">Webhook: ${esc(a.webhookStatus || '—')} · Verification: ${a.verification ? (a.verification.ok ? '✓ 200 + static HTML confirmed' : '⚠ failed: ' + Object.entries(a.verification.checks).filter(([, v]) => !v).map(([k]) => k).join(', ')) : '—'} · Visibility: ${esc(a.visibility)}</p>
+      <p><a href="${esc(a.publishedUrl)}" target="_blank" style="color:var(--accent2)">View live page →</a></p>` : ''}
     <p style="margin-top:14px"><button onclick="closeModal()" data-testid="modal-close">Close</button></p>`;
   $('#modal-wrap').classList.add('show');
 };
+
+function ownerCell(v) {
+  if (v === null) return '<td class="cite-nobody" data-testid="cite-nobody">◌ nobody</td>';
+  if (v === 'client') return '<td class="cite-yes">● client</td>';
+  return `<td class="cite-no">${esc(v.replace('competitor:', ''))}</td>`;
+}
 
 window.viewReport = (rid) => {
   const r = sel().reports.find(x => x.id === rid);
@@ -1334,10 +1909,20 @@ window.viewReport = (rid) => {
     <table><tr><th>Keyword</th><th>Impressions</th><th>Clicks</th><th>Position</th></tr>
     ${r.keywords.slice(0, 8).map(k => `<tr><td>${esc(k.keyword)}</td><td>${k.impressions}</td><td>${k.clicks}</td><td>${k.position}</td></tr>`).join('')}
     </table>
-    <h2>Citations per engine</h2>
+    <h2>Citations per engine (our articles)</h2>
     <table data-testid="citation-matrix"><tr><th>Article</th>${ENGINES.map(e => `<th>${ENGINE_LABEL[e]}</th>`).join('')}</tr>
     ${r.citations.map(row => `<tr><td>${esc(row.slug)}</td>${ENGINES.map(e =>
       `<td class="${row.engines[e] ? 'cite-yes' : 'cite-no'}">${row.engines[e] ? '● cited' : '○ not cited'}</td>`).join('')}</tr>`).join('')}
+    </table>
+    <h2>Query ownership — who does each engine cite? (◌ nobody = whitespace)</h2>
+    <table data-testid="query-ownership"><tr><th>Query</th>${ENGINES.map(e => `<th>${ENGINE_LABEL[e]}</th>`).join('')}</tr>
+    ${(r.queryCitations || []).slice(0, 8).map(row => `<tr><td>${esc(row.query)}</td>${ENGINES.map(e => ownerCell(row.engines[e])).join('')}</tr>`).join('')}
+    </table>
+    <h2>Citation whitespace (${(r.whitespace || []).length}) — cheapest wins, fed back to Research</h2>
+    ${(r.whitespace || []).length ? (r.whitespace || []).map(w => `<p data-testid="whitespace-query">◌ “${esc(w.query)}” — 2+ engines cite nobody</p>`).join('') : '<p class="dim">None this week.</p>'}
+    <h2>Hidden-post traffic (threshold ${sel().thresholds.visitorThreshold} visitors / ${sel().thresholds.visitorWindowDays} days)</h2>
+    <table data-testid="visitors-table"><tr><th>Article</th><th>Visitors</th></tr>
+    ${(r.visitors || []).map(v => `<tr><td>${esc(v.slug)}</td><td>${v.visitors}</td></tr>`).join('')}
     </table>
     <h2>Traffic (GA4)</h2>
     <p class="dim">Organic sessions: ${r.ga4.organicSessions} · Engagement: ${r.ga4.engagementRate} · Conversions: ${r.ga4.conversions}</p>
@@ -1364,9 +1949,13 @@ function render() {
   const c = sel();
   if (!c) return;
 
-  const tabs = ['pipeline', 'plan', 'content', 'publishing', 'monitoring', 'escalations', 'audit', 'settings'];
+  const tabs = ['pipeline', 'baseline', 'plan', 'content', 'publishing', 'monitoring', 'escalations', 'audit', 'settings'];
   const openEsc = c.escalations.filter(e => e.status === 'open').length;
-  const label = { escalations: `escalations${openEsc ? ` (${openEsc})` : ''}` };
+  const pendingNotif = c.notifications ? c.notifications.filter(n => n.status === 'pending').length : 0;
+  const label = {
+    escalations: `escalations${openEsc ? ` (${openEsc})` : ''}`,
+    publishing: `publishing${pendingNotif ? ` (${pendingNotif})` : ''}`
+  };
   $('#content').innerHTML = `
     <h1 data-testid="client-name">${esc(c.name)}</h1>
     <p class="dim">${esc(c.domain)} · ${esc(c.niche)} · ${c.reviewMode === 'client_review' ? 'client review mode' : 'auto-publish mode'}</p>
@@ -1378,7 +1967,7 @@ function render() {
 function renderOnboard() {
   $('#content').innerHTML = `
     <h1>Onboard a new client</h1>
-    <p class="dim">Step 1 of the pipeline — everything downstream runs from this brief.</p>
+    <p class="dim">Step 1 of the pipeline — a baseline audit of the existing site runs automatically, then everything downstream runs from this brief.</p>
     <form class="panel" onsubmit="return submitOnboard(event)" style="margin-top:14px">
       <label>Client name</label><input name="name" data-testid="ob-name" required>
       <label>Domain</label><input name="domain" data-testid="ob-domain" placeholder="client.example" required>
@@ -1397,7 +1986,7 @@ function renderOnboard() {
 
 function renderTab(c) {
   return {
-    pipeline: renderPipeline, plan: renderPlan, content: renderContent,
+    pipeline: renderPipeline, baseline: renderBaseline, plan: renderPlan, content: renderContent,
     publishing: renderPublishing, monitoring: renderMonitoring,
     escalations: renderEscalations, audit: renderAudit, settings: renderSettings
   }[state.tab](c);
@@ -1411,25 +2000,26 @@ function renderPipeline(c) {
     return e ? `${badge(e.status)}<p>${esc(e.summary)}</p>` : '<p class="dim">Not run yet.</p><p></p>';
   };
   const stages = [
+    ['baseline', '0 · Baseline', 'Pre-engagement audit: existing pages, citations, whitespace, robots'],
     ['research', '1 · Research', 'Keyword discovery, topical map, content gaps → monthly plan'],
     ['brief', '2 · Brief', 'Per-article briefs: keywords, headings, links, schema, angle'],
-    ['writer', '3 · Writer', 'GEO-structured long-form drafts from each brief'],
-    ['quality', '4 · Quality', `Scores vs threshold ${c.thresholds.qualityMin}; retry loop; escalation`],
-    ['publish', '5 · Publish', 'Crawl check, WP post, metadata, llms.txt, IndexNow + GSC'],
-    ['monitor', '6 · Monitor', 'Weekly rankings, per-engine citations, drops, new gaps'],
-    ['optimize', '7 · Optimize', 'Fix flagged pages, republish, feed gaps back to Research']
+    ['writer', '3 · Writer', 'Signal-Clarity drafts with semantic relationship links'],
+    ['quality', '4 · Quality', `Rubric v2 vs threshold ${c.thresholds.qualityMin}; retry loop; contradiction gate`],
+    ['publish', '5 · Publish', 'Crawl check, symmetry gate, hidden WP post, sitemap + llms.txt, pings'],
+    ['monitor', '6 · Monitor', 'Weekly citations, whitespace, drops, traffic thresholds, new gaps'],
+    ['optimize', '7 · Optimize', 'Fix flagged pages, republish, feed gaps + whitespace to Research']
   ];
   return `
     <div class="row" style="margin-bottom:14px">
       <button class="primary" data-testid="run-full" onclick="runStage('full')">▶ Run full pipeline</button>
-      <span class="dim">Runs Research → Publish, halting at human gates.</span>
+      <span class="dim">Runs Research → Publish, halting at human gates; symmetry holds trigger one bounded second pass.</span>
     </div>
     <div class="cards">
       ${stages.map(([id, name, desc]) => `
         <div class="card" data-testid="stage-${id}">
           <h3>${name}</h3>
           <p>${desc}</p>
-          <div data-testid="stage-${id}-last">${last(id === 'quality' ? 'quality' : id)}</div>
+          <div data-testid="stage-${id}-last">${last(id)}</div>
           <button data-testid="run-${id}" onclick="runStage('${id}')" style="margin-top:8px">Run</button>
         </div>`).join('')}
     </div>
@@ -1439,10 +2029,47 @@ function renderPipeline(c) {
       Briefs: ${c.briefs.length} ·
       Drafts: ${count(c, 'draft')} · Pending client review: ${count(c, 'pending_client_review')} ·
       Approved: ${count(c, 'approved')} · Published: ${count(c, 'published')} ·
+      Hidden: ${c.articles.filter(a => a.publishedUrl && a.visibility === 'hidden').length} ·
+      Visible: ${c.articles.filter(a => a.publishedUrl && a.visibility === 'visible').length} ·
       Flagged: ${count(c, 'flagged')} · Escalated: ${count(c, 'escalated')} ·
       Open escalations: ${c.escalations.filter(e => e.status === 'open').length} ·
+      Pending visibility decisions: ${c.notifications ? c.notifications.filter(n => n.status === 'pending').length : 0} ·
       Gaps queued: ${c.pendingGaps.length}
     </p>`;
+}
+
+function renderBaseline(c) {
+  const b = c.baseline;
+  if (!b) return '<div class="empty" data-testid="baseline-empty">No baseline audit yet — run stage 0.</div>';
+  const s = b.summary;
+  return `
+    <div class="row">
+      <h2 style="margin:0">Baseline audit — the “before” picture</h2>
+      <span class="dim">${esc(b.createdAt.slice(0, 10))}</span>
+      <button data-testid="rerun-baseline" onclick="runStage('baseline')">Re-run</button>
+    </div>
+    <p class="dim" data-testid="baseline-summary">Avg citability ${s.avgCitability}/100 · ${s.jsRenderedPages} JS-rendered · ${s.orphanPages} orphaned ·
+      ${s.pagesWithoutSchema} without schema · ${s.contradictionsFound} contradictions · ${s.whitespaceQueries} whitespace queries ·
+      robots.txt ${b.robots.ok ? '✓ all AI crawlers allowed' : '⚠ BLOCKS ' + b.robots.blocked.join(', ')}</p>
+    <h2>Existing pages</h2>
+    <table data-testid="baseline-pages">
+      <tr><th>Page</th><th>Citability</th><th>Words</th><th>Schema</th><th>Flags</th></tr>
+      ${b.pages.map(p => `<tr>
+        <td>${esc(p.title)}<br><span class="dim mono">${esc(p.url)}</span></td>
+        <td>${p.citability}/100</td><td>${p.wordCount}</td>
+        <td>${p.hasSchema ? '✓' : '—'}</td>
+        <td class="dim">${[p.jsRendered ? '⚠ JS-rendered' : '', p.orphan ? '⚠ orphan' : ''].filter(Boolean).join(' · ') || '—'}</td>
+      </tr>`).join('')}
+    </table>
+    <h2>Contradictions in existing content (${b.contradictions.length})</h2>
+    ${b.contradictions.length ? b.contradictions.map(x => `
+      <p data-testid="baseline-contradiction">⛔ <span class="mono">${esc(x.subject)}</span>: ${x.a.value}% on ${esc(x.a.label)} vs ${x.b.value}% on ${esc(x.b.label)} ${x.severe ? badge('high') : badge('medium')}</p>`).join('')
+      : '<p class="dim">None found.</p>'}
+    <h2>Query baseline — who is cited today? (◌ nobody = whitespace)</h2>
+    <table data-testid="baseline-queries"><tr><th>Query</th>${ENGINES.map(e => `<th>${ENGINE_LABEL[e]}</th>`).join('')}</tr>
+    ${b.queries.map(row => `<tr><td>${esc(row.query)}</td>${ENGINES.map(e => ownerCell(row.engines[e])).join('')}</tr>`).join('')}
+    </table>
+    ${b.whitespace.length ? `<p class="dim" data-testid="baseline-whitespace">Whitespace queries (nobody cited on 2+ engines): ${b.whitespace.map(esc).join(' · ')}</p>` : ''}`;
 }
 
 function renderPlan(c) {
@@ -1457,11 +2084,14 @@ function renderPlan(c) {
         <button class="danger" data-testid="plan-reject" onclick="planDecide('reject')">Reject</button>` : ''}
     </div>
     <p class="dim">${p.keywords.length} keywords · ${p.clusters.length} clusters · ${p.gapKeywordsConsumed} gap keywords fed back from Monitor</p>
+    ${(p.contradictions || []).length ? `
+      <h2>Corpus contradictions flagged (${p.contradictions.length})</h2>
+      ${p.contradictions.slice(0, 5).map(x => `<p class="dim" data-testid="plan-contradiction">⛔ ${esc(x.subject)}: ${x.a.value}% (${esc(x.a.label)}) vs ${x.b.value}% (${esc(x.b.label)}) — update or remove one</p>`).join('')}` : ''}
     <h2>Prioritized articles (long-tail first)</h2>
     <table data-testid="plan-table">
       <tr><th>#</th><th>Keyword</th><th>Competition</th><th>Volume</th><th>Intent</th><th>Source</th></tr>
       ${p.prioritizedArticles.map((k, i) =>
-        `<tr><td>${i + 1}</td><td>${esc(k.keyword)}</td><td>${badge(k.competition)}</td><td>${k.volume}</td><td>${esc(k.intent)}</td><td>${esc(k.source)}</td></tr>`).join('')}
+        `<tr><td>${i + 1}</td><td>${esc(k.keyword)}</td><td>${badge(k.competition)}</td><td>${k.volume}</td><td>${esc(k.intent)}</td><td>${k.source === 'citation_whitespace' ? '<span class="badge b-low">◌ whitespace</span>' : esc(k.source)}</td></tr>`).join('')}
     </table>
     <h2>Topical map (hub &amp; spoke)</h2>
     ${p.clusters.map(cl => `
@@ -1476,12 +2106,13 @@ function renderContent(c) {
   return `
     <p class="dim">${c.briefs.length} briefs · ${c.articles.length} articles</p>
     <table data-testid="articles-table">
-      <tr><th>Article</th><th>Keyword</th><th>Status</th><th>Score</th><th>Attempt</th><th>v</th><th></th></tr>
+      <tr><th>Article</th><th>Keyword</th><th>Status</th><th>Visibility</th><th>Score</th><th>Attempt</th><th>v</th><th></th></tr>
       ${c.articles.map(a => `
         <tr data-testid="article-row-${esc(a.slug)}">
           <td>${esc(a.title)}</td>
           <td class="dim">${esc(a.keyword)}</td>
-          <td>${badge(a.status)}</td>
+          <td>${badge(a.status)}${a.feedback && (a.feedback.failed || []).includes('symmetryGate') ? ' <span class="dim">⚠ symmetry</span>' : ''}</td>
+          <td>${a.publishedUrl ? badge(a.visibility || 'hidden') : '<span class="dim">—</span>'}</td>
           <td>${a.score ?? '—'}</td>
           <td>${a.attempt}</td>
           <td>${a.version}</td>
@@ -1497,19 +2128,40 @@ function renderContent(c) {
 }
 
 function renderPublishing(c) {
+  const pending = (c.notifications || []).filter(n => n.status === 'pending');
+  const decided = (c.notifications || []).filter(n => n.status !== 'pending');
   if (!c.wp.posts.length) return '<div class="empty" data-testid="publishing-empty">Nothing published yet.</div>';
   return `
     <p>
+      <a href="/mock-wp/${c.id}/sitemap.xml" target="_blank" data-testid="link-sitemap" style="color:var(--accent2)">sitemap.xml</a> ·
       <a href="/mock-wp/${c.id}/llms.txt" target="_blank" data-testid="link-llms" style="color:var(--accent2)">llms.txt</a> ·
       <a href="/mock-wp/${c.id}/robots.txt" target="_blank" data-testid="link-robots" style="color:var(--accent2)">robots.txt</a>
     </p>
+    ${pending.length ? `
+      <h2>Traffic-threshold notifications — client decision needed (${pending.length})</h2>
+      ${pending.map(n => `
+        <div class="card" style="margin-bottom:8px" data-testid="notification-${esc(n.slug)}">
+          <h3>“${esc(n.title)}”</h3>
+          <p>${n.visitors} visitors in ${n.windowDays} days — above the threshold. Make it publicly visible?</p>
+          <div class="row">
+            <button class="primary" data-testid="notif-visible-${esc(n.slug)}" onclick="visibilityDecide('${n.articleId}','make_visible')">Make visible</button>
+            <button data-testid="notif-hidden-${esc(n.slug)}" onclick="visibilityDecide('${n.articleId}','keep_hidden')">Keep hidden</button>
+          </div>
+        </div>`).join('')}` : ''}
     <table data-testid="posts-table">
-      <tr><th>Post</th><th>Canonical</th><th>Schema</th><th>v</th><th></th></tr>
-      ${c.wp.posts.map(p => `
-        <tr><td>${esc(p.title)}</td><td class="mono dim">${esc(p.canonical)}</td>
+      <tr><th>Post</th><th>Cluster</th><th>Visibility</th><th>Webhook</th><th>Schema</th><th>v</th><th></th></tr>
+      ${c.wp.posts.map(p => {
+        const art = c.articles.find(a => a.slug === p.slug) || {};
+        return `
+        <tr><td>${esc(p.title)}${p.isPillar ? ' <span class="badge b-low">pillar</span>' : ''}</td>
+        <td class="dim">${esc(p.clusterTopic || '—')}</td>
+        <td data-testid="post-vis-${esc(p.slug)}">${p.inNavigation ? badge('visible') : badge('hidden')}</td>
+        <td class="dim">${esc(art.webhookStatus || '—')}</td>
         <td class="dim">${p.schema.map(s => esc(s['@type'])).join(', ')}</td><td>${p.version}</td>
-        <td><a href="${esc(p.url)}" target="_blank" data-testid="post-link-${esc(p.slug)}" style="color:var(--accent2)">Open →</a></td></tr>`).join('')}
+        <td><a href="${esc(p.url)}" target="_blank" data-testid="post-link-${esc(p.slug)}" style="color:var(--accent2)">Open →</a></td></tr>`;
+      }).join('')}
     </table>
+    ${decided.length ? `<p class="dim">Past visibility decisions: ${decided.map(n => `${esc(n.slug)} → ${esc(n.decision)}`).join(' · ')}</p>` : ''}
     <h2>Indexing pings</h2>
     <table data-testid="pings-table">
       <tr><th>Service</th><th>URLs</th><th>When</th></tr>
@@ -1525,13 +2177,14 @@ function renderMonitoring(c) {
     </div>
     ${!c.reports.length ? '<div class="empty" data-testid="reports-empty">No reports yet.</div>' : `
     <table data-testid="reports-table">
-      <tr><th>Report</th><th>Status</th><th>Citations</th><th>Dropped</th><th>Gaps</th><th></th></tr>
+      <tr><th>Report</th><th>Status</th><th>Citations</th><th>Whitespace</th><th>Dropped</th><th>Gaps</th><th></th></tr>
       ${[...c.reports].reverse().map(r => {
         const cited = r.citations.reduce((s, row) => s + Object.values(row.engines).filter(Boolean).length, 0);
         return `<tr data-testid="report-row-${r.week}">
           <td>#${r.week} <span class="dim">${esc(r.createdAt.slice(0, 10))}</span></td>
           <td>${badge(r.status)}</td>
           <td>${cited}/${r.citations.length * 4}</td>
+          <td>${(r.whitespace || []).length}</td>
           <td>${r.droppedPages.length}</td>
           <td>${r.newGaps.length}</td>
           <td class="row">
@@ -1543,7 +2196,7 @@ function renderMonitoring(c) {
     ${c.optimizationLog.length ? `
       <h2>Optimization log</h2>
       ${c.optimizationLog.map(l => `<div class="card" style="margin-bottom:8px" data-testid="opt-log">
-        <p class="dim">${esc(l.ts)} — ${l.pages.length} pages updated, ${l.gapsFedBack} gaps fed back to Research</p>
+        <p class="dim">${esc(l.ts)} — ${l.pages.length} pages updated, ${l.gapsFedBack} gaps + whitespace queries fed back to Research</p>
         ${l.pages.map(pg => `<p class="dim">↻ ${esc(pg.slug)} → v${pg.version}: ${pg.actions.map(esc).join(', ')}</p>`).join('')}
       </div>`).join('')}` : ''}`;
 }
@@ -1584,12 +2237,16 @@ function renderSettings(c) {
   return `
     <form class="panel" onsubmit="return saveSettings(event)">
       <h2 style="margin-top:0">Thresholds</h2>
-      <label>Quality minimum GEO score (0–100)</label>
+      <label>Quality minimum Signal Clarity score (0–100)</label>
       <input type="number" name="qualityMin" data-testid="set-qualitymin" value="${c.thresholds.qualityMin}" min="0" max="101">
       <label>Max writer attempts before escalation</label>
       <input type="number" name="maxWriterAttempts" data-testid="set-maxattempts" value="${c.thresholds.maxWriterAttempts}" min="1" max="10">
       <label>Ranking drop sensitivity (positions)</label>
       <input type="number" name="dropSensitivity" data-testid="set-dropsensitivity" value="${c.thresholds.dropSensitivity}" min="1" max="50">
+      <label>Visitor threshold for visibility notification</label>
+      <input type="number" name="visitorThreshold" data-testid="set-visitorthreshold" value="${c.thresholds.visitorThreshold}" min="1" max="1000">
+      <label>Visitor window (days)</label>
+      <input type="number" name="visitorWindowDays" data-testid="set-visitorwindow" value="${c.thresholds.visitorWindowDays}" min="1" max="90">
       <h2>Approval gates</h2>
       <label>Content approval mode</label>
       <select name="reviewMode" data-testid="set-reviewmode">
@@ -1600,9 +2257,13 @@ function renderSettings(c) {
         <input type="checkbox" id="robots" name="simulateRobotsBlock" data-testid="set-robotsblock" ${c.simulateRobotsBlock ? 'checked' : ''}>
         <label for="robots" style="margin:0">Simulate robots.txt blocking AI crawlers (demo)</label>
       </div>
+      <div class="check">
+        <input type="checkbox" id="webhookfail" name="simulateWebhookFailure" data-testid="set-webhookfail" ${c.simulateWebhookFailure ? 'checked' : ''}>
+        <label for="webhookfail" style="margin:0">Simulate missing publish-confirmation webhook (demo)</label>
+      </div>
       <h2>Plugin API</h2>
       <p class="dim">API key for the WordPress plugin: <span class="mono" data-testid="api-key">${esc(c.apiKey)}</span></p>
-      <p class="dim mono">GET /api/plugin/published · GET /api/plugin/performance · POST /api/plugin/settings · POST /api/plugin/content-decision</p>
+      <p class="dim mono">GET /api/plugin/published · GET /api/plugin/performance · GET /api/plugin/notifications · POST /api/plugin/settings · POST /api/plugin/content-decision · POST /api/plugin/visibility-decision · POST /api/plugin/publish-confirmation</p>
       <p style="margin-top:14px"><button class="primary" type="submit" data-testid="set-save">Save settings</button></p>
     </form>`;
 }
